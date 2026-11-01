@@ -692,23 +692,18 @@ jobs:
         # the rendered HTML inside CDATA. Sparkle's description view
         # is WebKit, so anything pandoc emits (headings, lists,
         # fenced code, links, emphasis) renders.
+        #
+        # The splice lives in render-appcast-notes.sh so CI can test it:
+        # done inline with `awk -v`, it escape-processed the HTML and
+        # turned the `QuMesh\bin\` in the v1.4.2 notes into a backspace
+        # that blocked the publish (#447).
         if: hashFiles('appcast/item-macos.xml') != '' || hashFiles('appcast/item-windows.xml') != ''
         run: |
-          NOTES_HTML=$(pandoc -f gfm -t html < "$NOTES_MD_FILE")
+          NOTES_HTML_FILE="$RUNNER_TEMP/release-notes.html"
+          pandoc -f gfm -t html < "$NOTES_MD_FILE" > "$NOTES_HTML_FILE"
 
-          for fragment in appcast/item-macos.xml appcast/item-windows.xml; do
-            if [ -f "$fragment" ]; then
-              awk -v html="$NOTES_HTML" '
-                /__NOTES_HTML_PLACEHOLDER__/ {
-                  print "  <description><![CDATA["
-                  print html
-                  print "  ]]></description>"
-                  next
-                }
-                { print }
-              ' "$fragment" > "$fragment.tmp" && mv "$fragment.tmp" "$fragment"
-            fi
-          done
+          .github/scripts/render-appcast-notes.sh "$NOTES_HTML_FILE" \
+            appcast/item-macos.xml appcast/item-windows.xml
 
           echo "--- Rendered fragments ---"
           for fragment in appcast/item-macos.xml appcast/item-windows.xml; do

@@ -258,8 +258,19 @@ jobs:
       - name: Test release-body.sh
         run: .github/scripts/test-release-body.sh
 
+      # Same blind spot for the appcast: the v1.4.2 notes' `QuMesh\bin\`
+      # broke the publish step's XML (#447). xmllint checks the output
+      # and isn't preinstalled on ubuntu-latest (see #210).
+      - name: Install xmllint
+        run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends libxml2-utils
+
+      - name: Test render-appcast-notes.sh
+        run: .github/scripts/test-render-appcast-notes.sh
+
       - name: Shellcheck the release scripts
-        run: shellcheck .github/scripts/release-body.sh .github/scripts/test-release-body.sh
+        run: |
+          shellcheck .github/scripts/release-body.sh .github/scripts/test-release-body.sh \
+                     .github/scripts/render-appcast-notes.sh .github/scripts/test-render-appcast-notes.sh
 
   windows-install-verifier:
     # verify-windows-install.sh guards the Windows install layout
