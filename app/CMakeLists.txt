@@ -354,6 +354,13 @@ if(APPLE)
     )
 endif()
 
+# On Windows QuMesh.exe sits at the install root (`%ProgramFiles%\QuMesh\`)
+# and every DLL it imports must sit beside it — the loader searches the
+# exe's own directory and PATH, never a subdirectory. WinSparkle, the
+# OpenSSL/libssh DLLs and the Qt deploy script all install here; see
+# the comment above qt_generate_deploy_qml_app_script() below.
+set(_qumesh_win_bindir ".")
+
 # --- In-app auto-update ----------------------------------------------
 #
 # Two platform backends share the QML-facing `Updater` facade
@@ -469,7 +476,7 @@ elseif(WIN32 AND QUMESH_AUTOUPDATE)
             "$<TARGET_FILE_DIR:qumesh>/WinSparkle.dll"
         VERBATIM
     )
-    install(FILES "${_winsparkle_dll}" DESTINATION .)
+    install(FILES "${_winsparkle_dll}" DESTINATION "${_qumesh_win_bindir}")
 
     # WinSparkle takes its appcast URL + EdDSA public key via C-API
     # calls at startup. Bake both into a generated header so the wiring
@@ -557,7 +564,7 @@ endif()
 if(APPLE)
     install(TARGETS qumesh BUNDLE DESTINATION .)
 elseif(WIN32)
-    install(TARGETS qumesh RUNTIME DESTINATION .)
+    install(TARGETS qumesh RUNTIME DESTINATION "${_qumesh_win_bindir}")
 else()
     install(TARGETS qumesh RUNTIME DESTINATION bin)
 endif()
@@ -616,7 +623,7 @@ if(WIN32)
     endforeach()
     if(_windeps_dlls)
         list(REMOVE_DUPLICATES _windeps_dlls)
-        install(FILES ${_windeps_dlls} DESTINATION .)
+        install(FILES ${_windeps_dlls} DESTINATION "${_qumesh_win_bindir}")
         # Also copy into the build tree so `cmake --build && QuMesh.exe`
         # finds the DLLs without an `install` first.
         add_custom_command(TARGET qumesh POST_BUILD
@@ -647,11 +654,24 @@ endif()
 # script still copies Qt's QML plugin tree into the install staging
 # dir, and CPack then tries to ship a 100-plus-MB .deb that overlaps
 # the system Qt6 packages — and fails (issue #256).
+#
+# On Windows the deploy script runs `windeployqt --libdir
+# ${QT_DEPLOY_BIN_DIR}` and writes qt.conf into that same directory.
+# QT_DEPLOY_BIN_DIR defaults to CMAKE_INSTALL_BINDIR (`bin`), which put
+# every Qt DLL in `QuMesh\bin\` while QuMesh.exe sat one level up, so
+# the installed app failed to start with "Qt6QuickControls2.dll was not
+# found" (#445). Qt's deploy support only fills QT_DEPLOY_BIN_DIR in
+# when it's unset, so pre-seeding it in an install(CODE) that runs just
+# before the script lands the DLLs and qt.conf next to the exe. plugins/
+# and qml/ keep their default spots under the install root.
 if(APPLE OR WIN32)
     qt_generate_deploy_qml_app_script(
         TARGET qumesh
         OUTPUT_SCRIPT qumesh_deploy_script
     )
+    if(WIN32)
+        install(CODE "set(QT_DEPLOY_BIN_DIR \"${_qumesh_win_bindir}\")")
+    endif()
     install(SCRIPT ${qumesh_deploy_script})
 endif()
 

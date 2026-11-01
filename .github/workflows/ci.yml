@@ -135,6 +135,21 @@ jobs:
           set "PATH=%RUNNER_TEMP%\windeps\x64-windows\bin;%PATH%"
           ctest --output-on-failure --parallel
 
+      # Every Windows release through v1.4.1 installed the Qt DLLs into
+      # `QuMesh\bin\` while QuMesh.exe sat one level up, so the app
+      # never started on a user's machine (#445). Nothing on a PR ran
+      # the install rules + windeployqt, and the release smoke launch
+      # had Qt's own bin\ on PATH. Install the same tree CPack packs
+      # and run it with PATH and the Qt env vars scrubbed.
+      - name: Install and verify (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          PREFIX="$(cygpath -u "$RUNNER_TEMP")/qumesh-install"
+          cmake --install build --prefix "$PREFIX"
+          .github/scripts/verify-windows-install.sh "$PREFIX"
+
   # Mirrors the matrix used by release.yml's `build-linux` job so PRs
   # catch the two regressions that are easy to introduce when only
   # macOS/Windows are tested at PR time:
@@ -245,3 +260,20 @@ jobs:
 
       - name: Shellcheck the release scripts
         run: shellcheck .github/scripts/release-body.sh .github/scripts/test-release-body.sh
+
+  windows-install-verifier:
+    # verify-windows-install.sh guards the Windows install layout
+    # (#445) in the Windows job above and in release.yml. Its layout
+    # and import checks are plain bash, so exercise them here against
+    # fake install trees — including the broken v1.4.1 shape — so a
+    # change that blinds the verifier fails on its own.
+    name: Windows install verifier
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Test verify-windows-install.sh
+        run: .github/scripts/test-verify-windows-install.sh
+
+      - name: Shellcheck the verifier
+        run: shellcheck .github/scripts/verify-windows-install.sh .github/scripts/test-verify-windows-install.sh

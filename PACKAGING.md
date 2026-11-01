@@ -264,8 +264,9 @@ To add a new language:
 - The QML modules QuMesh imports (`QtQuick`, `QtQuick.Controls.Basic`,
   `QtQuick.Layouts`, `QtQuick.Dialogs`, etc.), discovered via
   `qmlimportscanner`. (Linux: pulled in via Qt 6 declarative-dev.)
-- `libcrypto-3-x64.dll` on Windows (Qt's deploy tool doesn't follow
-  non-Qt DLL dependencies).
+- `libcrypto-3-x64.dll`, `libssl-3-x64.dll`, `legacy.dll` and
+  `ssh.dll` on Windows (Qt's deploy tool doesn't follow non-Qt DLL
+  dependencies).
 - The bundled fonts (IBM Plex Sans, JetBrains Mono).
 - `LICENSE.rtf` — Apache 2.0 license text, rendered from the
   repo-root `LICENSE.md`. Lives at `QuMesh.app/Contents/Resources/`
@@ -275,6 +276,29 @@ To add a new language:
 - Linux also installs `qumesh.desktop` (apps menu) and
   `com.insynergy.QuMesh.metainfo.xml` (AppStream catalogue entry)
   plus the hicolor icon set at 16/24/32/48/64/96/128/256/512 px.
+
+### Windows install layout
+
+The Windows install is flat: `QuMesh.exe`, `qt.conf`, and every DLL it
+loads (Qt, OpenSSL, libssh, WinSparkle) sit together in
+`%ProgramFiles%\QuMesh\`, with `plugins\`, `qml\` and `translations\`
+underneath. The Windows loader only searches the exe's own directory
+and `PATH` for DLLs, so nothing the exe imports can live in a
+subdirectory. Qt's deploy script defaults to putting the DLLs in
+`bin\`, so `app/CMakeLists.txt` points it at the install root instead.
+Through v1.4.1 it didn't, so no Windows release could start (#445).
+
+`.github/scripts/verify-windows-install.sh <install-dir>` checks a
+tree for that layout, walks every import table with `dumpbin`, then
+launches the app with `PATH` and the Qt env vars stripped. CI runs it
+on a `cmake --install` prefix on every PR, and `release.yml` runs it
+after silently installing the real NSIS installer. To check a local
+build from a Visual Studio developer shell in Git Bash:
+
+```
+cmake --install build --prefix /c/tmp/qumesh-install
+.github/scripts/verify-windows-install.sh /c/tmp/qumesh-install
+```
 
 ## DMG mount-window layout (macOS)
 
