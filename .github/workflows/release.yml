@@ -222,35 +222,34 @@ jobs:
             exit $RC
           fi
 
-      - name: Smoke-launch bundled app (Windows)
+      # Install the real NSIS installer silently and verify the tree it
+      # leaves behind — the exact path users take. This used to launch
+      # the CPack-staged QuMesh.exe in place, which passed even though
+      # every Qt DLL was in `QuMesh\bin\` one level below the exe:
+      # install-qt-action had Qt's own bin\ on PATH, so the loader never
+      # needed the bundled copies (#445). verify-windows-install.sh
+      # scrubs PATH and the Qt env vars before launching.
+      - name: Silent-install bundled app (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        working-directory: build
+        run: |
+          $installer = Get-ChildItem QuMesh-*-windows-x64.exe | Select-Object -First 1
+          if (-not $installer) { throw "No QuMesh-*-windows-x64.exe to install" }
+          $dest = Join-Path $env:RUNNER_TEMP 'QuMesh-installed'
+          # NSIS: /S is silent; /D= must come last and stay unquoted.
+          $p = Start-Process -FilePath $installer.FullName `
+                             -ArgumentList '/S', "/D=$dest" -Wait -PassThru
+          if ($p.ExitCode -ne 0) { throw "Installer exited $($p.ExitCode)" }
+          Get-ChildItem $dest | Format-Table -AutoSize Mode, Length, Name
+
+      - name: Verify installed app (Windows)
         if: runner.os == 'Windows'
         shell: bash
-        working-directory: build
-        env:
-          QUMESH_SMOKE_EXIT_MS: '3000'
-          QT_QPA_PLATFORM: offscreen
         run: |
-          STAGED=$(find _CPack_Packages -maxdepth 6 -name 'QuMesh.exe' -type f | head -1)
-          if [ -z "$STAGED" ]; then
-            echo "Could not locate staged QuMesh.exe" >&2
-            exit 1
-          fi
-          echo "Smoke-launching $STAGED"
-          # GNU timeout doesn't propagate Windows exit codes well; rely
-          # on the process exiting on its own under QUMESH_SMOKE_EXIT_MS.
-          "$STAGED" &
-          APP_PID=$!
-          # Hard backstop: kill after 60s if it hasn't exited.
-          ( sleep 60 && kill -9 $APP_PID 2>/dev/null ) &
-          GUARD_PID=$!
-          if wait $APP_PID; then
-            kill -9 $GUARD_PID 2>/dev/null
-            exit 0
-          else
-            RC=$?
-            kill -9 $GUARD_PID 2>/dev/null
-            exit $RC
-          fi
+          set -euo pipefail
+          .github/scripts/verify-windows-install.sh \
+            "$(cygpath -u "$RUNNER_TEMP")/QuMesh-installed"
 
       - name: Sign update for WinSparkle (Windows, when secret provisioned)
         if: runner.os == 'Windows' && env.SPARKLE_ED_PRIVATE_KEY != ''
