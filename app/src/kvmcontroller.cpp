@@ -106,9 +106,11 @@ void KvmController::setState(State s)
     // particular has no counterpart on the client side.
     qCDebug(lcKvmController) << "state" << stateName(m_state) << "->" << stateName(s);
     const bool wasAwaiting = (m_state == State::AwaitingTrust);
+    const bool wasPending = colorDepthPending();
     m_state = s;
     emit stateChanged();
     if (wasAwaiting != (s == State::AwaitingTrust)) emit awaitingTrustChanged();
+    if (wasPending != colorDepthPending()) emit colorDepthChanged();
 }
 
 void KvmController::setLastError(const QString &e)
@@ -207,6 +209,7 @@ void KvmController::open()
 
     m_session = new KvmSession(m_client, this);
     m_session->setPreferredPixelFormat(preferredPixelFormat());
+    m_sessionColorDepthMode = m_colorDepthMode;
     m_eightBitColor = false;
     emit colorDepthChanged();
 

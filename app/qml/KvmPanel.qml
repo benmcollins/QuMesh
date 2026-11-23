@@ -182,13 +182,18 @@ Item {
                     case KvmController.Connecting:     return qsTr("Connecting…");
                     case KvmController.Authenticating: return qsTr("Authenticating…");
                     case KvmController.Negotiating:    return qsTr("Negotiating display…");
-                    case KvmController.Connected:      return controller.eightBitColor
-                                                            ? qsTr("%1×%2 · 8-bit")
-                                                                .arg(controller.desktopWidth)
-                                                                .arg(controller.desktopHeight)
-                                                            : qsTr("%1×%2")
-                                                                .arg(controller.desktopWidth)
-                                                                .arg(controller.desktopHeight);
+                    case KvmController.Connected: {
+                        const size = controller.eightBitColor
+                            ? qsTr("%1×%2 · 8-bit")
+                                .arg(controller.desktopWidth)
+                                .arg(controller.desktopHeight)
+                            : qsTr("%1×%2")
+                                .arg(controller.desktopWidth)
+                                .arg(controller.desktopHeight);
+                        return controller.colorDepthPending
+                            ? qsTr("%1 · reconnect to apply colour").arg(size)
+                            : size;
+                    }
                     case KvmController.Failed:         return qsTr("Failed: %1").arg(controller.lastError);
                     }
                     return "";
@@ -197,9 +202,14 @@ Item {
                 font.family: Type.sans
                 font.pixelSize: Type.sizeS
                 font.features: ({ "tnum": 1 })
-            }
+                elide: Text.ElideRight
+                Layout.fillWidth: true
+                Layout.minimumWidth: 48
+                ToolTip.visible: truncated && statusHover.hovered
+                ToolTip.text: text
 
-            Item { Layout.fillWidth: true }
+                HoverHandler { id: statusHover }
+            }
 
             Button {
                 text: qsTr("Save screenshot")
@@ -317,7 +327,8 @@ Item {
                 ToolTip.visible: hovered
                 ToolTip.text: qsTr("Intel AMT's KVM display buffer is limited. "
                                    + "Desktops above roughly 2560×1600 must use "
-                                   + "8-bit colour; Auto picks for you.")
+                                   + "8-bit colour; Auto picks for you. "
+                                   + "Changes apply when you reconnect in this window.")
                 onClicked: depthMenu.popup()
 
                 Menu {
