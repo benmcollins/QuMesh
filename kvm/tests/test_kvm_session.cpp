@@ -237,6 +237,8 @@ private slots:
     void oversizedDesktopFailsWithActionableError();
     void sameSizeDesktopSizeDoesNotResendPixelFormat();
     void changedDesktopSizeRenegotiatesPixelFormat();
+    void desktopResizeReselectsPixelFormat_data();
+    void desktopResizeReselectsPixelFormat();
 };
 
 void TestKvmSession::handshakeThroughFrameLoopWithRawTile()
@@ -577,6 +579,48 @@ void TestKvmSession::changedDesktopSizeRenegotiatesPixelFormat()
                  + buildFramebufferUpdateRequest(false, 0, 0, 640, 480));
     QCOMPARE(resizedSpy.last().at(0).toInt(), 640);
     QCOMPARE(resizedSpy.last().at(1).toInt(), 480);
+}
+
+// A resize must pick the format again for the new size, not re-send the
+// current one: 3840x2160 at 16-bit needs 16,588,800 bytes against AMT's
+// 9,216,000-byte limit, and the firmware hangs up (#433). The width-only
+// and height-only rows guard the size comparison in each dimension.
+
+void TestKvmSession::desktopResizeReselectsPixelFormat_data()
+{
+    QTest::addColumn<int>("fromW");
+    QTest::addColumn<int>("fromH");
+
+    QTest::newRow("both dimensions") << 320 << 240;
+    QTest::newRow("height only") << 3840 << 1080;
+    QTest::newRow("width only") << 1920 << 2160;
+}
+
+void TestKvmSession::desktopResizeReselectsPixelFormat()
+{
+    QFETCH(int, fromW);
+    QFETCH(int, fromH);
+
+    MockServer server;
+    QVERIFY(server.listen());
+
+    RedirectionClient client;
+    client.setProtocol(qumesh::redir::Protocol::Kvm);
+    client.setCredentials(QStringLiteral("admin"), QStringLiteral("p"));
+
+    KvmSession session(&client);
+    QVERIFY(!driveHandshakeAndCaptureSetup(server, client, session, fromW, fromH)
+                 .isEmpty());
+    QCOMPARE(session.pixelFormat(), PixelFormat::Rgb565);
+    server.received.clear();
+
+    server.m_socket->write(makeDesktopSizeUpdate(3840, 2160));
+
+    const QByteArray expected = buildSetPixelFormat(PixelFormat::Rgb332)
+        + buildFramebufferUpdateRequest(false, 0, 0, 3840, 2160);
+    QVERIFY(waitFor(2000, [&]() { return server.received.size() >= expected.size(); }));
+    QCOMPARE(server.received, expected);
+    QCOMPARE(session.pixelFormat(), PixelFormat::Rgb332);
 }
 
 QTEST_MAIN(TestKvmSession)
