@@ -221,6 +221,16 @@ QByteArray makeDesktopSizeUpdate(quint16 w, quint16 h)
     return b;
 }
 
+/// One FramebufferUpdate holding a DesktopSize rect, then a RAW rect.
+QByteArray makeDesktopSizeThenRawUpdate(quint16 desktopW, quint16 desktopH,
+                                         quint16 w, quint16 h, quint16 color)
+{
+    QByteArray b = makeDesktopSizeUpdate(desktopW, desktopH);
+    b[3] = 2;   // numRects
+    b.append(makeRawRectUpdate(0, 0, w, h, color).mid(4));
+    return b;
+}
+
 } // namespace
 
 class TestKvmSession : public QObject
@@ -239,6 +249,11 @@ private slots:
     void changedDesktopSizeRenegotiatesPixelFormat();
     void desktopResizeReselectsPixelFormat_data();
     void desktopResizeReselectsPixelFormat();
+    // #453 — a pixel rect may follow DesktopSize in the same update.
+    void pixelRectAfterResizeGetsFullRepaint();
+    void pixelRectAfterSameSizeStaysIncremental();
+    void pixelRectAfterDepthChangeDecodesAtOldDepth();
+    void oversizedResizeFailsBeforeUpdateCompletes();
 };
 
 void TestKvmSession::handshakeThroughFrameLoopWithRawTile()
@@ -621,6 +636,116 @@ void TestKvmSession::desktopResizeReselectsPixelFormat()
     QVERIFY(waitFor(2000, [&]() { return server.received.size() >= expected.size(); }));
     QCOMPARE(server.received, expected);
     QCOMPARE(session.pixelFormat(), PixelFormat::Rgb332);
+}
+
+void TestKvmSession::pixelRectAfterResizeGetsFullRepaint()
+{
+    MockServer server;
+    QVERIFY(server.listen());
+
+    RedirectionClient client;
+    client.setProtocol(qumesh::redir::Protocol::Kvm);
+    client.setCredentials(QStringLiteral("admin"), QStringLiteral("p"));
+
+    KvmSession session(&client);
+    QSignalSpy tileSpy(&session, &KvmSession::tileUpdated);
+    QVERIFY(!driveHandshakeAndCaptureSetup(server, client, session).isEmpty());
+    server.received.clear();
+
+    server.m_socket->write(makeDesktopSizeThenRawUpdate(640, 480, 4, 4, 0xF800));
+
+    const QByteArray expected = buildSetPixelFormat(PixelFormat::Rgb565)
+        + buildFramebufferUpdateRequest(false, 0, 0, 640, 480);
+    QVERIFY(waitFor(2000, [&]() { return server.received.size() >= expected.size(); }));
+    QTest::qWait(100);
+    QCOMPARE(server.received, expected);
+    QCOMPARE(tileSpy.size(), 1);
+}
+
+void TestKvmSession::pixelRectAfterSameSizeStaysIncremental()
+{
+    MockServer server;
+    QVERIFY(server.listen());
+
+    RedirectionClient client;
+    client.setProtocol(qumesh::redir::Protocol::Kvm);
+    client.setCredentials(QStringLiteral("admin"), QStringLiteral("p"));
+
+    KvmSession session(&client);
+    QVERIFY(!driveHandshakeAndCaptureSetup(server, client, session).isEmpty());
+    server.received.clear();
+
+    server.m_socket->write(makeDesktopSizeThenRawUpdate(320, 240, 4, 4, 0xF800));
+
+    const QByteArray expected = buildFramebufferUpdateRequest(true, 0, 0, 320, 240);
+    QVERIFY(waitFor(2000, [&]() { return server.received.size() >= expected.size(); }));
+    QTest::qWait(100);
+    QCOMPARE(server.received, expected);
+}
+
+void TestKvmSession::pixelRectAfterDepthChangeDecodesAtOldDepth()
+{
+    // The RAW rect was encoded before the server could see the 8-bit
+    // SetPixelFormat this resize triggers. Decoding it at 8-bit would
+    // consume half its bytes and misread the rest as a server message.
+    MockServer server;
+    QVERIFY(server.listen());
+
+    RedirectionClient client;
+    client.setProtocol(qumesh::redir::Protocol::Kvm);
+    client.setCredentials(QStringLiteral("admin"), QStringLiteral("p"));
+
+    KvmSession session(&client);
+    QSignalSpy tileSpy(&session, &KvmSession::tileUpdated);
+    QVERIFY(!driveHandshakeAndCaptureSetup(server, client, session).isEmpty());
+    server.received.clear();
+
+    server.m_socket->write(makeDesktopSizeThenRawUpdate(3840, 2160, 2, 2, 0xF800));
+
+    const QByteArray expected = buildSetPixelFormat(PixelFormat::Rgb332)
+        + buildFramebufferUpdateRequest(false, 0, 0, 3840, 2160);
+    QVERIFY(waitFor(2000, [&]() { return server.received.size() >= expected.size(); }));
+    QTest::qWait(100);
+    QCOMPARE(server.received, expected);
+    QCOMPARE(session.state(), KvmSession::State::FrameLoop);
+    QCOMPARE(session.pixelFormat(), PixelFormat::Rgb332);
+
+    QCOMPARE(tileSpy.size(), 1);
+    const QImage tile = tileSpy.first().at(2).value<QImage>();
+    QCOMPARE(tile.size(), QSize(2, 2));
+    const QColor pixel = tile.pixelColor(1, 1);
+    QVERIFY2(pixel.red() > 200 && pixel.green() == 0 && pixel.blue() == 0,
+             "the rect must be decoded as RGB565 red");
+}
+
+void TestKvmSession::oversizedResizeFailsBeforeUpdateCompletes()
+{
+    // The second rect never arrives: AMT may hang up rather than finish
+    // an update for a desktop it cannot buffer, and the #433 guidance
+    // must not depend on reaching the end of it.
+    MockServer server;
+    QVERIFY(server.listen());
+
+    RedirectionClient client;
+    client.setProtocol(qumesh::redir::Protocol::Kvm);
+    client.setCredentials(QStringLiteral("admin"), QStringLiteral("p"));
+
+    KvmSession session(&client);
+    session.setPreferredPixelFormat(PixelFormat::Rgb565);
+    QSignalSpy closedSpy(&session, &KvmSession::closed);
+    QVERIFY(!driveHandshakeAndCaptureSetup(server, client, session).isEmpty());
+    server.received.clear();
+
+    QByteArray update = makeDesktopSizeUpdate(3840, 2160);
+    update[3] = 2;   // numRects
+    server.m_socket->write(update);
+
+    QVERIFY(waitFor(2000, [&]() { return closedSpy.size() == 1; }));
+    QCOMPARE(session.state(), KvmSession::State::Failed);
+    QVERIFY2(session.lastError().contains(QStringLiteral("display")),
+             qPrintable(session.lastError()));
+    QTest::qWait(100);
+    QVERIFY2(server.received.isEmpty(), "must not ask AMT for a buffer it cannot allocate");
 }
 
 QTEST_MAIN(TestKvmSession)

@@ -10,6 +10,8 @@
 #include <QLoggingCategory>
 #include <QMetaObject>
 
+#include <utility>
+
 Q_LOGGING_CATEGORY(lcKvmSession, "qumesh.kvm.session", QtInfoMsg)
 
 namespace qumesh::kvm {
@@ -69,6 +71,7 @@ void KvmSession::start()
     // Re-derive the format from the next ServerInit; a previous session
     // may have dropped to 8-bit for a desktop that has since changed.
     m_format = PixelFormat::Rgb565;
+    m_resizedInUpdate = false;
     m_compressionEnabled = readCompressionEnabled();
     qCInfo(lcKvmSession) << "KVM compression"
                           << (m_compressionEnabled
@@ -206,24 +209,13 @@ bool KvmSession::stepFrameLoop()
 
         if (dr.isDesktopSize) {
             const bool sizeChanged = (rect.w != m_width || rect.h != m_height);
+            m_resizedInUpdate = m_resizedInUpdate || sizeChanged;
             m_width = rect.w;
             m_height = rect.h;
             emit desktopResized(m_width, m_height);
-            // A resize changes the display-buffer arithmetic, so the
-            // format that fitted the old desktop may not fit this one.
-            // Re-negotiate before asking for pixels, then force a full
-            // repaint — an incremental request against a
-            // freshly-resized framebuffer leaves the screen stale.
-            // Only when the size really changed: some firmwares answer
-            // every SetPixelFormat with a DesktopSize of the same
-            // dimensions, and re-negotiating on those loops forever
-            // without a single pixel rect arriving.
-            if (sizeChanged && !negotiatePixelFormat(m_width, m_height)) return false;
-            m_inbox.remove(0, rectConsumed + payloadConsumed);
-            --m_pendingRects;
-            if (m_pendingRects == 0)
-                writeFrame(buildFramebufferUpdateRequest(false, 0, 0, m_width, m_height));
-            return true;
+            // Diagnose an oversized desktop now rather than at the end
+            // of the update: the firmware may hang up before then.
+            if (sizeChanged && !checkDisplayBuffer(m_width, m_height)) return false;
         } else if (!dr.image.isNull()) {
             emit tileUpdated(rect.x, rect.y, dr.image);
         }
@@ -231,7 +223,9 @@ bool KvmSession::stepFrameLoop()
         m_inbox.remove(0, rectConsumed + payloadConsumed);
         --m_pendingRects;
 
-        if (m_pendingRects == 0) requestIncremental();
+        if (m_pendingRects > 0) return true;
+        if (dr.isDesktopSize || m_resizedInUpdate) return finishResizedUpdate();
+        requestIncremental();
         return true;
     }
 
@@ -277,33 +271,38 @@ bool KvmSession::stepFrameLoop()
     return false;
 }
 
+bool KvmSession::checkDisplayBuffer(int w, int h)
+{
+    const PixelFormat wanted = m_preferredFormat.value_or(chooseFormatFor(w, h));
+    const qint64 needed = displayBufferBytes(wanted, w, h);
+    if (needed <= kMaxDisplayBufferBytes) return true;
+
+    // No supported format fits. Fail loudly here rather than writing
+    // SetPixelFormat and letting AMT hang up on us — the firmware gives
+    // no error, it just closes the socket, which is what made #433 look
+    // like a network fault.
+    const bool forced = m_preferredFormat.has_value();
+    fail(QStringLiteral(
+             "The %1×%2 desktop needs %3 MB of Intel AMT KVM display "
+             "buffer, over the firmware's %4 MB limit%5. Lower the "
+             "target's resolution%6.")
+             .arg(w).arg(h)
+             .arg(needed / 1048576.0, 0, 'f', 1)
+             .arg(kMaxDisplayBufferBytes / 1048576.0, 0, 'f', 1)
+             .arg(forced ? QStringLiteral(" at the colour depth you selected")
+                         : QString())
+             .arg(forced ? QStringLiteral(" or switch colour depth back to Auto")
+                         : QString()));
+    return false;
+}
+
 bool KvmSession::negotiatePixelFormat(int w, int h)
 {
     if (w <= 0 || h <= 0) return true; // nothing to size yet
+    if (!checkDisplayBuffer(w, h)) return false;
 
     const PixelFormat wanted = m_preferredFormat.value_or(chooseFormatFor(w, h));
     const qint64 needed = displayBufferBytes(wanted, w, h);
-
-    if (needed > kMaxDisplayBufferBytes) {
-        // No supported format fits. Fail loudly here rather than
-        // writing SetPixelFormat and letting AMT hang up on us — the
-        // firmware gives no error, it just closes the socket, which is
-        // what made #433 look like a network fault.
-        const bool forced = m_preferredFormat.has_value();
-        fail(QStringLiteral(
-                 "The %1×%2 desktop needs %3 MB of Intel AMT KVM display "
-                 "buffer, over the firmware's %4 MB limit%5. Lower the "
-                 "target's resolution%6.")
-                 .arg(w).arg(h)
-                 .arg(needed / 1048576.0, 0, 'f', 1)
-                 .arg(kMaxDisplayBufferBytes / 1048576.0, 0, 'f', 1)
-                 .arg(forced ? QStringLiteral(" at the colour depth you selected")
-                             : QString())
-                 .arg(forced ? QStringLiteral(" or switch colour depth back to Auto")
-                             : QString()));
-        return false;
-    }
-
     const bool changed = (wanted != m_format);
     m_format = wanted;
     qCInfo(lcKvmSession) << "KVM pixel format"
@@ -315,6 +314,26 @@ bool KvmSession::negotiatePixelFormat(int w, int h)
     writeFrame(buildSetPixelFormat(m_format));
     if (changed) emit pixelFormatChanged(m_format);
     return true;
+}
+
+bool KvmSession::finishResizedUpdate()
+{
+    // A resize changes the display-buffer arithmetic, so the format that
+    // fitted the old desktop may not fit this one. Wait for the end of
+    // the update: its remaining rects were encoded before the server
+    // could see a new SetPixelFormat. Only on a real size change, because
+    // some firmwares answer every SetPixelFormat with a DesktopSize of
+    // the same dimensions, and re-negotiating on those loops forever
+    // without a single pixel rect arriving (#449).
+    const bool sizeChanged = std::exchange(m_resizedInUpdate, false);
+    if (sizeChanged
+        && (!negotiatePixelFormat(m_width, m_height) || m_state == State::Failed)) {
+        return false;
+    }
+    // Force a full repaint: an incremental request against a
+    // freshly-resized framebuffer leaves the screen stale.
+    writeFrame(buildFramebufferUpdateRequest(false, 0, 0, m_width, m_height));
+    return m_state != State::Failed;
 }
 
 void KvmSession::requestIncremental()
