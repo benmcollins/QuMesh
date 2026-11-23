@@ -207,6 +207,20 @@ QByteArray makeRawRectUpdate(quint16 x, quint16 y, quint16 w, quint16 h,
     return b;
 }
 
+QByteArray makeDesktopSizeUpdate(quint16 w, quint16 h)
+{
+    QByteArray b;
+    b.append(char(MsgFramebufferUpdate));
+    b.append(char(0x00));
+    b.append(be16(1));
+    b.append(be16(0));
+    b.append(be16(0));
+    b.append(be16(w));
+    b.append(be16(h));
+    b.append(be32(static_cast<quint32>(EncDesktopSize)));
+    return b;
+}
+
 } // namespace
 
 class TestKvmSession : public QObject
@@ -221,6 +235,8 @@ private slots:
     void fourKDesktopNegotiatesEightBitColour();
     void ordinaryDesktopKeepsSixteenBitColour();
     void oversizedDesktopFailsWithActionableError();
+    void sameSizeDesktopSizeDoesNotResendPixelFormat();
+    void changedDesktopSizeRenegotiatesPixelFormat();
 };
 
 void TestKvmSession::handshakeThroughFrameLoopWithRawTile()
@@ -510,6 +526,57 @@ void TestKvmSession::oversizedDesktopFailsWithActionableError()
     QVERIFY2(reason.contains(QStringLiteral("display")), qPrintable(reason));
     QVERIFY2(!sent.contains(buildSetPixelFormat(PixelFormat::Rgb565)),
               "must not ask AMT for a buffer it cannot allocate");
+}
+
+// Some AMT firmwares (seen on a Lenovo ThinkCentre M70q) answer every
+// SetPixelFormat with a DesktopSize rect carrying the unchanged size.
+// Replying with another SetPixelFormat loops forever and the viewer
+// stays blank while input keeps working.
+
+void TestKvmSession::sameSizeDesktopSizeDoesNotResendPixelFormat()
+{
+    MockServer server;
+    QVERIFY(server.listen());
+
+    RedirectionClient client;
+    client.setProtocol(qumesh::redir::Protocol::Kvm);
+    client.setCredentials(QStringLiteral("admin"), QStringLiteral("p"));
+
+    KvmSession session(&client);
+    QVERIFY(!driveHandshakeAndCaptureSetup(server, client, session).isEmpty());
+    QCOMPARE(session.state(), KvmSession::State::FrameLoop);
+    server.received.clear();
+
+    server.m_socket->write(makeDesktopSizeUpdate(320, 240));
+
+    QVERIFY(waitFor(2000, [&]() { return server.received.size() >= 10; }));
+    QTest::qWait(100);
+    QCOMPARE(server.received,
+             buildFramebufferUpdateRequest(false, 0, 0, 320, 240));
+}
+
+void TestKvmSession::changedDesktopSizeRenegotiatesPixelFormat()
+{
+    MockServer server;
+    QVERIFY(server.listen());
+
+    RedirectionClient client;
+    client.setProtocol(qumesh::redir::Protocol::Kvm);
+    client.setCredentials(QStringLiteral("admin"), QStringLiteral("p"));
+
+    KvmSession session(&client);
+    QSignalSpy resizedSpy(&session, &KvmSession::desktopResized);
+    QVERIFY(!driveHandshakeAndCaptureSetup(server, client, session).isEmpty());
+    server.received.clear();
+
+    server.m_socket->write(makeDesktopSizeUpdate(640, 480));
+
+    QVERIFY(waitFor(2000, [&]() { return server.received.size() >= 30; }));
+    QCOMPARE(server.received,
+             buildSetPixelFormat(PixelFormat::Rgb565)
+                 + buildFramebufferUpdateRequest(false, 0, 0, 640, 480));
+    QCOMPARE(resizedSpy.last().at(0).toInt(), 640);
+    QCOMPARE(resizedSpy.last().at(1).toInt(), 480);
 }
 
 QTEST_MAIN(TestKvmSession)

@@ -205,6 +205,7 @@ bool KvmSession::stepFrameLoop()
         }
 
         if (dr.isDesktopSize) {
+            const bool sizeChanged = (rect.w != m_width || rect.h != m_height);
             m_width = rect.w;
             m_height = rect.h;
             emit desktopResized(m_width, m_height);
@@ -213,7 +214,11 @@ bool KvmSession::stepFrameLoop()
             // Re-negotiate before asking for pixels, then force a full
             // repaint — an incremental request against a
             // freshly-resized framebuffer leaves the screen stale.
-            if (!negotiatePixelFormat(m_width, m_height)) return false;
+            // Only when the size really changed: some firmwares answer
+            // every SetPixelFormat with a DesktopSize of the same
+            // dimensions, and re-negotiating on those loops forever
+            // without a single pixel rect arriving.
+            if (sizeChanged && !negotiatePixelFormat(m_width, m_height)) return false;
             m_inbox.remove(0, rectConsumed + payloadConsumed);
             --m_pendingRects;
             if (m_pendingRects == 0)
