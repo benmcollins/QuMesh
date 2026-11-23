@@ -5,6 +5,7 @@
 #include "kvmframebuffer.h"
 
 #include <QDataStream>
+#include <QElapsedTimer>
 #include <QGuiApplication>
 #include <QHostAddress>
 #include <QImage>
@@ -179,10 +180,17 @@ void configure(KvmController &c, const MockAmtKvmServer &server)
 
 bool waitForSetup(const KvmController &c, const MockAmtKvmServer &server)
 {
-    return QTest::qWaitFor([&]() {
-        return c.state() == KvmController::State::Connected
-            && server.wire.size() >= kKvmSetupBytes;
-    }, 5000);
+    // Not QTest::qWaitFor: it sleeps 10 ms per event-loop pass, and this
+    // handshake needs dozens of passes, which takes seconds on a loaded
+    // CI runner.
+    QElapsedTimer timer;
+    timer.start();
+    while (c.state() != KvmController::State::Connected
+           || server.wire.size() < kKvmSetupBytes) {
+        if (timer.hasExpired(10000)) return false;
+        QCoreApplication::processEvents(QEventLoop::AllEvents, 25);
+    }
+    return true;
 }
 
 } // namespace
