@@ -64,6 +64,10 @@ class KvmController : public QObject
     /// shows this so an automatic drop is visible rather than looking
     /// like a rendering bug.
     Q_PROPERTY(bool eightBitColor READ eightBitColor NOTIFY colorDepthChanged)
+    /// True while connected with a `colorDepthMode` this session did not
+    /// open with. The mode applies on the next connection: switching
+    /// live would race the rects already in flight at the old depth.
+    Q_PROPERTY(bool colorDepthPending READ colorDepthPending NOTIFY colorDepthChanged)
 
     // SSH host-key prompt — see `SshHostKeyTrustDialog.qml`. Bound
     // when the per-machine SSH tunnel encounters an unpinned key.
@@ -160,6 +164,10 @@ public:
     [[nodiscard]] int colorDepthMode() const { return m_colorDepthMode; }
     void setColorDepthMode(int v);
     [[nodiscard]] bool eightBitColor() const { return m_eightBitColor; }
+    [[nodiscard]] bool colorDepthPending() const
+    {
+        return m_state == State::Connected && m_colorDepthMode != m_sessionColorDepthMode;
+    }
 
 signals:
     void hostChanged();
@@ -204,6 +212,7 @@ private:
     [[nodiscard]] std::optional<qumesh::kvm::PixelFormat> preferredPixelFormat() const;
 
     int m_colorDepthMode = 0;   ///< 0 Auto, 1 force 16-bit, 2 force 8-bit.
+    int m_sessionColorDepthMode = 0;   ///< The mode the current session opened with.
     bool m_eightBitColor = false;
     int m_width = 0;
     int m_height = 0;
