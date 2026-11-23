@@ -98,10 +98,17 @@ private:
     /// when the desktop is too large for AMT's display buffer at any
     /// supported format.
     bool negotiatePixelFormat(int w, int h);
+    /// Returns false (after calling `fail()`) when a `w × h` desktop
+    /// does not fit AMT's display buffer at the format it would use.
+    bool checkDisplayBuffer(int w, int h);
     void onRawBytes(const QByteArray &chunk);
     void drainInbox();
     bool stepHandshake();
     bool stepFrameLoop();
+    /// End of an update whose last rect is a DesktopSize, or that
+    /// changed the size earlier: re-negotiate if the size changed, then
+    /// request a full repaint. Returns false after `fail()`.
+    bool finishResizedUpdate();
     void requestIncremental();
     void setState(State s);
     void fail(QString reason);
@@ -117,6 +124,7 @@ private:
     PixelFormat m_format = PixelFormat::Rgb565;
     std::optional<PixelFormat> m_preferredFormat;
     int m_pendingRects = 0;
+    bool m_resizedInUpdate = false;   ///< A DesktopSize in this update changed the size.
     InflateStream m_inflate;     ///< Persists across all RLE blocks.
 
     /// Cached at `start()`. Compression is on by default;
