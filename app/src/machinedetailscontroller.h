@@ -1213,6 +1213,16 @@ private:
     void endOptInRound();
     void requestOptInReread();
     void flushOptInReread();
+    /// Bumped as each consent policy write (`setKvmOptInPolicyEnabled`,
+    /// `setKvmSettings`) is answered. A status read the answer overtook
+    /// may report the policy from before the write, so its policy fields
+    /// are not kept (#463). One answered before the write can only report
+    /// what is already shown, since nothing local changes until then.
+    quint64 m_optInPolicyGeneration = 0;
+    /// A write was answered; read the firmware once nothing is on the wire.
+    bool m_optInPolicyRereadPending = false;
+    void optInPolicyWriteAnswered();
+    void flushOptInPolicyReread();
     /// Set once `getOptInStatus` has returned successfully.
     bool m_optInStatusKnown = false;
     /// A status read has succeeded at least once. `m_optInStatusKnown`

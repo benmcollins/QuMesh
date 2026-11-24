@@ -624,11 +624,18 @@ void MachineDetailsController::refreshOptInStatus()
     // Only a read sent while polling is known to postdate this round's
     // accepted StartOptIn.
     const quint64 pollRound = m_optInPolling ? m_optInRoundSerial : 0;
+    const quint64 policyGeneration = m_optInPolicyGeneration;
     qumesh::wsman::getOptInStatus(m_client,
-        [this, stateGeneration, pollRound](qumesh::wsman::OptInServiceResult r) {
+        [this, stateGeneration, pollRound, policyGeneration](qumesh::wsman::OptInServiceResult r) {
             m_optInStatusInFlight = false;
             if (r.ok) {
                 const bool wasKnown = m_optInStatusKnown;
+                // A policy write was answered while this read was on the
+                // wire, so the policy it reports may predate the write.
+                // Keep what we have instead, if a read has ever given us
+                // anything (#463).
+                const bool stalePolicy = m_optInStatusReadOk
+                    && policyGeneration != m_optInPolicyGeneration;
                 m_optInStatusKnown = true;
                 m_optInStatusReadOk = true;
                 const int prevState = m_optInState;
@@ -646,15 +653,17 @@ void MachineDetailsController::refreshOptInStatus()
                     && r.optInState == 2) {
                     m_optInRoundSawDisplayed = true;
                 }
-                m_optInRequired         = r.optInRequired;
-                m_optInRequiredRaw      = r.optInRequiredRaw;
                 if (!staleState) m_optInState = r.optInState;
-                m_canModifyOptInPolicy  = r.canModifyOptInPolicy;
-                m_kvmOptInPolicy        = r.kvmOptInPolicy;
-                m_optInPolicyTimeoutSec = r.optInPolicyTimeoutSec;
-                m_kvmIs5900PortEnabled  = r.is5900PortEnabled;
-                m_kvmSessionTimeoutMinutes = r.sessionTimeoutMinutes;
-                m_kvmGreyscaleRequested = r.greyscalePixelFormatRequested;
+                if (!stalePolicy) {
+                    m_optInRequired         = r.optInRequired;
+                    m_optInRequiredRaw      = r.optInRequiredRaw;
+                    m_canModifyOptInPolicy  = r.canModifyOptInPolicy;
+                    m_kvmOptInPolicy        = r.kvmOptInPolicy;
+                    m_optInPolicyTimeoutSec = r.optInPolicyTimeoutSec;
+                    m_kvmIs5900PortEnabled  = r.is5900PortEnabled;
+                    m_kvmSessionTimeoutMinutes = r.sessionTimeoutMinutes;
+                    m_kvmGreyscaleRequested = r.greyscalePixelFormatRequested;
+                }
                 // Guarded on change: startOptInPolling runs this every
                 // 500 ms, so an unconditional line would be a firehose.
                 // One line per real transition is the whole diagnostic.
@@ -730,8 +739,25 @@ void MachineDetailsController::refreshOptInStatus()
             // A later failure leaves the previously-read values alone —
             // a blip must not downgrade a machine we know needs consent.
             decInflight();
+            flushOptInPolicyReread();
             flushOptInReread();
         });
+}
+
+void MachineDetailsController::optInPolicyWriteAnswered()
+{
+    ++m_optInPolicyGeneration;
+    m_optInPolicyRereadPending = true;
+    flushOptInPolicyReread();
+}
+
+void MachineDetailsController::flushOptInPolicyReread()
+{
+    // A read already on the wire predates the write; refreshOptInStatus
+    // would drop this one on its in-flight guard, so wait for it.
+    if (!m_optInPolicyRereadPending || m_optInStatusInFlight) return;
+    m_optInPolicyRereadPending = false;
+    refreshOptInStatus();
 }
 
 void MachineDetailsController::setKvmOptInPolicyEnabled(bool enabled)
@@ -746,8 +772,11 @@ void MachineDetailsController::setKvmOptInPolicyEnabled(bool enabled)
                 emit optInStatusChanged();
                 // Re-read the runtime fields too — disabling the
                 // policy flips `OptInRequired` back to false.
-                refreshOptInStatus();
+                optInPolicyWriteAnswered();
             } else {
+                // The Put may still have landed (a lost reply), and a read
+                // it overtook is no longer kept, so ask the firmware.
+                optInPolicyWriteAnswered();
                 emit optInPolicyChangeFailed(r.error);
             }
         });
@@ -789,7 +818,7 @@ void MachineDetailsController::setKvmSettings(const QVariantMap &fields)
                 setLastError(QStringLiteral("KVM settings: %1").arg(r.error));
             // Re-read so the read-only QML bindings reflect the
             // firmware's reality (which may have clamped values).
-            refreshOptInStatus();
+            optInPolicyWriteAnswered();
         });
 }
 
