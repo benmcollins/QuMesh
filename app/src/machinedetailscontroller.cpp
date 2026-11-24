@@ -65,7 +65,14 @@ void MachineDetailsController::setSshConfig(const QVariantMap &cfg)
     const bool enabled = cfg.value(QStringLiteral("enabled")).toBool();
     if (!enabled) {
         m_sshEnabled = false;
+        // The session's own Disconnected arrives queued, after the
+        // deleteLater below has destroyed it, so it never clears this.
+        // Left set, every later refresh would wait on a tunnel that is
+        // gone (cancelling the host-key prompt lands here).
+        m_sshConnecting = false;
         if (m_sshSession != nullptr) {
+            // Its state handler dereferences m_sshSession.
+            m_sshSession->disconnect(this);
             m_sshSession->close();
             m_sshSession->deleteLater();
             m_sshSession = nullptr;
@@ -80,6 +87,10 @@ void MachineDetailsController::setSshConfig(const QVariantMap &cfg)
         m_client->setSerializeRequests(false);
         m_sshTunnelStatus.clear();
         emit sshTunnelStateChanged();
+        // Refreshes parked for the tunnel now go the way every later
+        // request will: directly, as SSH is off. Dropping them would
+        // leave a waiting Connect doing nothing.
+        runPendingRefreshes();
         return;
     }
 
@@ -94,6 +105,7 @@ void MachineDetailsController::setSshConfig(const QVariantMap &cfg)
         m_sshSession = new qumesh::ssh::SshSession(this);
         connect(m_sshSession, &qumesh::ssh::SshSession::stateChanged, this,
                 [this](qumesh::ssh::SshSession::State s) {
+                    bool resumeOptInRead = false;
                     switch (s) {
                     case qumesh::ssh::SshSession::Connecting:
                         m_sshTunnelStatus = QStringLiteral("Connecting…"); break;
@@ -110,6 +122,10 @@ void MachineDetailsController::setSshConfig(const QVariantMap &cfg)
                         m_sshTunnelStatus = QStringLiteral("SSH failed: %1")
                                                 .arg(m_sshSession->lastError());
                         m_sshConnecting = false;
+                        // A Connect is waiting on this read. Dropping it
+                        // would leave Connect doing nothing at all; sent
+                        // now, it fails through the tunnel and resolves.
+                        resumeOptInRead = (m_pendingRefreshes & PendingOptInStatus) != 0;
                         m_pendingRefreshes = 0;
                         break;
                     case qumesh::ssh::SshSession::Disconnected:
@@ -119,6 +135,7 @@ void MachineDetailsController::setSshConfig(const QVariantMap &cfg)
                         break;
                     }
                     emit sshTunnelStateChanged();
+                    if (resumeOptInRead) refreshOptInStatus();
                 });
         connect(m_sshSession, &qumesh::ssh::SshSession::hostKeyPromptRequired, this,
                 [this](const QString &fp, const QString &keyType) {
@@ -153,6 +170,14 @@ void MachineDetailsController::setSshConfig(const QVariantMap &cfg)
                                   .toList();
     for (const QVariant &v : fps) p.trustedHostKeyFingerprints.append(v.toString());
 
+    applySshSocketFactory();
+    m_sshSession->open(p);
+    emit sshTunnelStateChanged();
+}
+
+void MachineDetailsController::applySshSocketFactory()
+{
+    if (!m_sshEnabled || m_sshSession == nullptr) return;
     // Each WSMAN request opens a fresh SshTunnel; the channel is short-
     // lived (the WsmanClient closes the socket once the response body
     // is consumed). Channel-create cost over an already-authenticated
@@ -160,9 +185,6 @@ void MachineDetailsController::setSshConfig(const QVariantMap &cfg)
     m_client->setSocketFactory(makeSshSocketFactory(
         m_sshSession, m_host,
         static_cast<quint16>(m_tls ? 16993 : 16992)));
-
-    m_sshSession->open(p);
-    emit sshTunnelStateChanged();
 }
 
 void MachineDetailsController::trustPendingSshHostKey(bool persist)
@@ -204,6 +226,7 @@ void MachineDetailsController::runPendingRefreshes()
     if (p & PendingEventSubscriptions) refreshEventSubscriptions();
     if (p & PendingWakeAlarms)   refreshWakeAlarms();
     if (p & PendingSystemDefense) refreshSystemDefense();
+    if (p & PendingOptInStatus)  refreshOptInStatus();
 }
 
 void MachineDetailsController::setHost(const QString &v)
@@ -284,6 +307,7 @@ QString MachineDetailsController::powerStateLabel() const
 
 void MachineDetailsController::rebuildEndpoint()
 {
+    applySshSocketFactory();
     if (m_host.isEmpty()) return;
     QUrl url;
     url.setScheme(m_tls ? QStringLiteral("https") : QStringLiteral("http"));
@@ -585,7 +609,7 @@ void MachineDetailsController::refreshOverview()
 
 void MachineDetailsController::refreshOptInStatus()
 {
-    if (deferIfSshConnecting(PendingOverview)) return;
+    if (deferIfSshConnecting(PendingOptInStatus)) return;
     rebuildEndpoint();
     if (m_host.isEmpty()) return;
     // Each call is two chained WSMAN GETs on their own connections and

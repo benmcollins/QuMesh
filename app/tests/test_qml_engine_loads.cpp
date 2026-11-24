@@ -262,6 +262,8 @@ int main(int argc, char *argv[])
     // Run headless on every platform regardless of whether the CI lane
     // sets QT_QPA_PLATFORM itself. Must happen before QGuiApplication.
     qputenv("QT_QPA_PLATFORM", "offscreen");
+    // No Keychain prompt for an unsigned test binary on macOS.
+    qputenv("QUMESH_NO_KEYSTORE", "1");
     // 2D software renderer keeps Qt Quick off any GPU / hardware
     // surface — sometimes needed under offscreen, and never harmful
     // for a load-only smoke test.

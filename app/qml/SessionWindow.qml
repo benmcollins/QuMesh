@@ -33,6 +33,9 @@ AppWindow {
 
     signal trustedFingerprintPersistRequested(string fingerprint)
     signal trustedSshHostKeyPersistRequested(string fingerprint)
+    /// A panel was cleared to connect: consent was granted or isn't
+    /// required for its protocol. `tab` uses the `initialTab` numbering.
+    signal connectReleased(int tab)
 
     function openTab(idx) {
         bar.currentIndex = idx;
@@ -75,6 +78,7 @@ AppWindow {
     function consentResolved() {
         const idx = root.pendingConnectTab;
         root.pendingConnectTab = -1;
+        if (idx >= 0) root.connectReleased(idx);
         if (idx === 0) solPanel.start();
         else if (idx === 1) kvmPanel.start();
         else if (idx === 2) iderPanel.start();
@@ -98,6 +102,11 @@ AppWindow {
     height: 720
     minimumWidth: 640
     minimumHeight: 420
+    // The Loader sets this only after the window is created, so
+    // `Component.onCompleted` would install an empty config and every
+    // consent and Power ▾ request would bypass the tunnel (#459).
+    onMachineSshConfigChanged: powerController.setSshConfig(root.machineSshConfig || ({}))
+
     title: qsTr("QuMesh — %1 — %2 — %3")
         .arg(root.label)
         .arg(root.targetHost)
@@ -107,12 +116,12 @@ AppWindow {
 
     MachineDetailsController {
         id: powerController
+        objectName: "powerController"
         host: root.targetHost
         user: root.user
         password: root.password
         tls: root.tls
         trustedFingerprints: root.trustedFingerprints
-        Component.onCompleted: powerController.setSshConfig(root.machineSshConfig || ({}))
         onTrustedFingerprintAdded: function(fp) {
             root.trustedFingerprintPersistRequested(fp);
         }
@@ -230,13 +239,9 @@ AppWindow {
         if (powerController.optInRoundActive) powerController.cancelOptIn();
     }
 
-    Component.onCompleted: {
-        bar.currentIndex = root.initialTab;
-        // Once the controller has the SSH config + host, ask AMT whether
-        // consent is required for redirection. The result lands in
-        // `onOptInStatusChanged` which kicks off `startOptIn` if needed.
-        powerController.refreshOptInStatus();
-    }
+    // No consent read here: the Loader hasn't set the host or the SSH
+    // config yet. Connect reads it when it isn't known.
+    Component.onCompleted: bar.currentIndex = root.initialTab
 
     ColumnLayout {
         anchors.fill: parent

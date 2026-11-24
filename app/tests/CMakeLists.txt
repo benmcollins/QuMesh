@@ -176,16 +176,19 @@ set_tests_properties(test_qml_engine_loads PROPERTIES
     ENVIRONMENT "QT_QPA_PLATFORM=offscreen"
 )
 
-# On Windows, run `windeployqt` against the test exe in a POST_BUILD
+# On Windows, run `windeployqt` against a QML test exe in a POST_BUILD
 # step so every Qt DLL the test transitively imports — and every Qt
 # plugin (qsvg image format, qoffscreen QPA, Qt Quick QML modules) —
 # lands next to the .exe. Otherwise the loader can't start the binary
 # under `ctest` and the test fails with zero captured output before
 # main() even runs (the failure mode that drove #262). The other Qt
 # tests in this dir get away with PATH alone because they don't pull
-# in the QML stack and its plugins. On macOS/Linux this block is a
-# no-op (no windeployqt; not needed). See #262.
-if(WIN32)
+# in the QML stack and its plugins. On macOS/Linux this is a no-op (no
+# windeployqt; not needed). See #262.
+function(qumesh_deploy_qml_test target)
+    if(NOT WIN32)
+        return()
+    endif()
     get_target_property(_qmake Qt6::qmake IMPORTED_LOCATION)
     get_filename_component(_qt_bin "${_qmake}" DIRECTORY)
     find_program(WINDEPLOYQT_EXE
@@ -194,21 +197,90 @@ if(WIN32)
         NO_DEFAULT_PATH
     )
     if(WINDEPLOYQT_EXE)
-        add_custom_command(TARGET test_qml_engine_loads POST_BUILD
+        add_custom_command(TARGET ${target} POST_BUILD
             COMMAND "${WINDEPLOYQT_EXE}"
                 --no-translations
                 --no-system-d3d-compiler
                 --no-opengl-sw
                 --qmldir "${CMAKE_CURRENT_SOURCE_DIR}/../qml"
-                "$<TARGET_FILE:test_qml_engine_loads>"
-            COMMENT "Running windeployqt on test_qml_engine_loads.exe"
+                "$<TARGET_FILE:${target}>"
+            COMMENT "Running windeployqt on ${target}.exe"
             VERBATIM
         )
     else()
         message(WARNING
             "windeployqt not found near Qt6::qmake (${_qt_bin}); "
-            "test_qml_engine_loads will likely fail to load on Windows.")
+            "${target} will likely fail to load on Windows.")
     endif()
+endfunction()
+qumesh_deploy_qml_test(test_qml_engine_loads)
+
+# SessionWindow's consent wiring, driven through the real QML module
+# against FakeAmt (#459). Same link set as test_qml_engine_loads, for
+# the same reasons, plus the controller headers it inspects.
+qt_add_executable(test_session_window
+    test_session_window.cpp
+    fake_amt.h
+    session_window_harness.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/updater.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/updater.h
+)
+target_include_directories(test_session_window PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+target_link_libraries(test_session_window PRIVATE
+    Qt6::Core
+    Qt6::Gui
+    Qt6::Network
+    Qt6::Qml
+    Qt6::Quick
+    Qt6::QuickControls2
+    Qt6::Svg
+    Qt6::Test
+    qumesh_appcore
+    qumesh_appcoreplugin
+    qumesh_appcoreplugin_init
+)
+add_test(NAME test_session_window COMMAND test_session_window)
+set_tests_properties(test_session_window PROPERTIES
+    ENVIRONMENT "QT_QPA_PLATFORM=offscreen"
+)
+qumesh_deploy_qml_test(test_session_window)
+# Both QML tests deploy into the same output directory; two windeployqt
+# runs at once would race on the same files.
+if(WIN32)
+    add_dependencies(test_session_window test_qml_engine_loads)
+endif()
+
+# The same window over a real SSH tunnel, through an in-process libssh
+# server that forwards to FakeAmt (#459). POSIX-only for the reason
+# given at test_ssh_tunnel_shutdown in ssh/tests/CMakeLists.txt.
+if(NOT WIN32)
+    qt_add_executable(test_session_window_ssh
+        test_session_window_ssh.cpp
+        fake_amt.h
+        session_window_harness.h
+        ${CMAKE_CURRENT_SOURCE_DIR}/../src/updater.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/../src/updater.h
+    )
+    target_include_directories(test_session_window_ssh PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+    target_link_libraries(test_session_window_ssh PRIVATE
+        Qt6::Core
+        Qt6::Gui
+        Qt6::Network
+        Qt6::Qml
+        Qt6::Quick
+        Qt6::QuickControls2
+        Qt6::Svg
+        Qt6::Test
+        qumesh_appcore
+        qumesh_appcoreplugin
+        qumesh_appcoreplugin_init
+        ssh
+        OpenSSL::Crypto
+    )
+    add_test(NAME test_session_window_ssh COMMAND test_session_window_ssh)
+    set_tests_properties(test_session_window_ssh PROPERTIES
+        ENVIRONMENT "QT_QPA_PLATFORM=offscreen"
+    )
 endif()
 
 qt_add_executable(test_solcontroller
@@ -258,6 +330,7 @@ add_test(NAME test_batchrunner COMMAND test_batchrunner)
 # re-requested, which is what dropped the KVM session mid-handshake.
 qt_add_executable(test_optin_statemachine
     test_optin_statemachine.cpp
+    fake_amt.h
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/machinedetailscontroller.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/machinedetailscontroller.h
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/ssh_tunnel_opener.cpp
