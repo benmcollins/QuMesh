@@ -11,6 +11,11 @@ import QuMesh
 /// Modal that asks the operator for the 6-digit consent code AMT is
 /// displaying on the target's local screen. Drive it via `openFor()`;
 /// resolves into `submitted(code)` or `cancelled`.
+///
+/// `cancelled` comes from `onRejected` alone, so Cancel, Escape and the
+/// countdown each report it exactly once (#461). Callers dismiss the
+/// dialog with `close()` once consent resolves, which stays silent: a
+/// stray cancel there would revoke a consent the firmware just granted.
 Dialog {
     id: root
 
@@ -27,6 +32,7 @@ Dialog {
     signal submitted(int code)
     signal cancelled
 
+    objectName: "optInPrompt"
     title: qsTr("Enter consent code")
     modal: true
     closePolicy: Popup.CloseOnEscape
@@ -35,6 +41,7 @@ Dialog {
     implicitWidth: 480
 
     onClosed: countdownTimer.stop()
+    onRejected: root.cancelled()
 
     Timer {
         id: countdownTimer
@@ -43,7 +50,6 @@ Dialog {
         onTriggered: {
             if (root.secondsRemaining <= 0) {
                 stop();
-                root.cancelled();
                 root.reject();
                 return;
             }
@@ -56,7 +62,9 @@ Dialog {
         codeField.text = "";
         root.timeoutSec = timeout || 0;
         root.secondsRemaining = root.timeoutSec;
-        countdownTimer.start();
+        // 0 means the firmware set no limit; there is nothing to count.
+        if (root.timeoutSec > 0) countdownTimer.start();
+        else countdownTimer.stop();
         root.open();
         codeField.forceActiveFocus();
     }
@@ -129,10 +137,7 @@ Dialog {
                 text: qsTr("Cancel")
                 font.family: Type.sans
                 font.pixelSize: Type.sizeS
-                onClicked: {
-                    root.cancelled();
-                    root.reject();
-                }
+                onClicked: root.reject()
             }
 
             AccentButton {
