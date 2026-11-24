@@ -29,6 +29,7 @@
 #include <QVariantMap>
 #include <QtTest>
 
+#include <cstdio>
 #include <memory>
 
 namespace qumesh::testing {
@@ -129,6 +130,10 @@ private:
 /// before the application object is constructed.
 inline void prepareHeadlessQml()
 {
+    // Unbuffered, so a crash still leaves the output up to that point:
+    // on Windows a piped stdout is fully buffered and is lost with it.
+    std::setvbuf(stdout, nullptr, _IONBF, 0);
+    std::setvbuf(stderr, nullptr, _IONBF, 0);
     // Before anything resolves a QStandardPaths location.
     QStandardPaths::setTestModeEnabled(true);
     // Keep the macOS Keychain out of it: an unsigned test binary gets a
