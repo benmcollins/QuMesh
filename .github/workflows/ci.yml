@@ -135,6 +135,20 @@ jobs:
           set "PATH=%RUNNER_TEMP%\windeps\x64-windows\bin;%PATH%"
           ctest --output-on-failure --parallel
 
+      # TEMPORARY (#464 diagnosis, remove before merge).
+      - name: Diagnose test_session_window (Windows)
+        if: failure() && runner.os == 'Windows'
+        shell: cmd
+        working-directory: build
+        run: |
+          set "PATH=%RUNNER_TEMP%\windeps\x64-windows\bin;%PATH%"
+          set QT_QPA_PLATFORM=offscreen
+          set QT_LOGGING_RULES=qumesh.*=true
+          app\tests\test_session_window.exe -o sw.txt,txt -o -,txt
+          echo exit=%ERRORLEVEL%
+          type sw.txt
+          dumpbin /headers app\tests\test_session_window.exe | findstr /i subsystem
+
       # Every Windows release through v1.4.1 installed the Qt DLLs into
       # `QuMesh\bin\` while QuMesh.exe sat one level up, so the app
       # never started on a user's machine (#445). Nothing on a PR ran
