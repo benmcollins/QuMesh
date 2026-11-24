@@ -1020,6 +1020,10 @@ signals:
 
 private:
     void rebuildEndpoint();
+    /// Point the WSMAN socket factory at the current host and port
+    /// through the SSH session. Re-run whenever either changes, so the
+    /// tunnel target doesn't depend on the order a window sets them.
+    void applySshSocketFactory();
     void changePowerState(int code);
     void incInflight();
     void decInflight();
@@ -1049,6 +1053,7 @@ private:
         PendingWakeAlarms          = 1 << 13,
         PendingSystemDefense       = 1 << 14,
         PendingActiveSessions      = 1 << 15,
+        PendingOptInStatus         = 1 << 16,
     };
     int m_pendingRefreshes = 0;
     /// `true` between `setSshConfig(enabled=true)` and the session
