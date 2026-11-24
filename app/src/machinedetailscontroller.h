@@ -960,6 +960,10 @@ signals:
     /// class. Consent is treated as not required and redirection is
     /// allowed to proceed; the UI may note it.
     void optInStatusUnavailable(const QString &error);
+    /// A consent status read failed after an earlier one succeeded.
+    /// The cached values are kept. Not emitted while polling, where a
+    /// missed tick is routine and the next one follows in 500 ms.
+    void optInStatusReadFailed(const QString &error);
     /// Result of a `setKvmOptInPolicyEnabled` Put. `ok=false` carries
     /// the firmware-reported reason (most commonly the AMT login lacks
     /// the realm to modify the policy).
@@ -1211,6 +1215,9 @@ private:
     void flushOptInReread();
     /// Set once `getOptInStatus` has returned successfully.
     bool m_optInStatusKnown = false;
+    /// A status read has succeeded at least once. `m_optInStatusKnown`
+    /// alone also covers the "unreadable, assume not required" fallback.
+    bool m_optInStatusReadOk = false;
     void setOptInRoundActive(bool v);
 
     void startOptInPolling();

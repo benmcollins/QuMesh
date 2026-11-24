@@ -84,18 +84,17 @@ AppWindow {
         else if (idx === 2) iderPanel.start();
     }
 
-    /// Connect entry point for every panel. Starts immediately when
-    /// consent isn't needed, otherwise defers until it is granted.
+    /// Connect entry point for every panel. Starts once a fresh status
+    /// read says consent isn't needed or is granted, otherwise asks.
     function requestConnect(idx) {
         root.pendingConnectTab = idx;
         powerController.resetOptInAttempts();
-        if (!powerController.optInStatusKnown) {
-            // Never dial before we know the policy — the default state
-            // reads as "no consent required" and would connect blind.
-            powerController.refreshOptInStatus();
-            return;
-        }
-        root.driveConsent();
+        // Always ask the firmware, even when the status is "known". The
+        // default state reads as "no consent required", and a cached
+        // Received or InSession is stale once a session has ended: AMT
+        // drops consent with it (#460). The result arrives through
+        // `onOptInStatusChanged`, which calls `driveConsent()`.
+        powerController.refreshOptInStatus();
     }
 
     width: 1024
@@ -146,6 +145,14 @@ AppWindow {
         // redirection session is live — which revoked the consent and
         // dropped the session the user had just unlocked (#433).
         onOptInStatusChanged: root.driveConsent()
+        // The read Connect is waiting on failed. Dialling on the cached
+        // state could skip a consent the firmware now wants.
+        onOptInStatusReadFailed: function(error) {
+            if (root.pendingConnectTab < 0 || powerController.optInRoundActive) return;
+            root.pendingConnectTab = -1;
+            ActivityHeartbeat.reportFailure(
+                qsTr("User consent: could not read the consent status: %1").arg(error));
+        }
         onOptInStarted: function(ok, error) {
             if (ok) optInPrompt.openFor(powerController.optInPolicyTimeoutSec);
             else ActivityHeartbeat.reportFailure(qsTr("User consent: %1").arg(error));
