@@ -20,6 +20,7 @@ class TestWsmanClient : public QObject
     Q_OBJECT
 private slots:
     void initTestCase();
+    void synchronousSocketFailureReachesFinished();
     // #435 — digest 401 retry cap + timeout on every path.
     void digestRetryIsCappedOnPersistent401();
     void staleNonceAllowsOneExtraRetry();
@@ -3024,6 +3025,25 @@ void TestWsmanClient::cachedChallengePathIsStillTimedOut()
               qPrintable(second.error));
 }
 
+
+// A failure inside sendEnvelope happens before the caller can connect to
+// finished(). Losing it left controllers busy with their callback unrun.
+void TestWsmanClient::synchronousSocketFailureReachesFinished()
+{
+    WsmanClient client;
+    client.setEndpoint(QUrl(QStringLiteral("http://127.0.0.1:16992/wsman")));
+    client.setCredentials(QStringLiteral("admin"), QStringLiteral("p"));
+    client.setSocketFactory([](WsmanClient::SocketCallback done) {
+        done(-1, QStringLiteral("no route to host"));
+    });
+
+    WsmanReply *reply = client.sendEnvelope(QByteArrayLiteral("<x/>"));
+    QSignalSpy finishedSpy(reply, &WsmanReply::finished);
+    QVERIFY(finishedSpy.wait(2000));
+    QVERIFY(reply->hasError());
+    QCOMPARE(finishedSpy.size(), 1);
+    reply->deleteLater();
+}
 
 QTEST_GUILESS_MAIN(TestWsmanClient)
 #include "test_wsman_client.moc"

@@ -1182,6 +1182,28 @@ private:
     /// concurrent sessions.
     quint16 m_portOverride = 0;   ///< Tests only; 0 = derive from `tls`.
     bool m_optInStatusInFlight = false;
+    /// Bumped when a consent operation is answered. A status read that
+    /// spans the reply must not write its OptInState back or drive
+    /// polling, since it may predate the operation.
+    quint64 m_optInStateGeneration = 0;
+    /// StartOptIn and CancelOptIn calls awaiting a reply.
+    int m_optInRoundOpsInFlight = 0;
+    /// Bumped when a round starts or ends. A reply from an older round
+    /// must not write OptInState or signal the UI.
+    quint64 m_optInRoundSerial = 0;
+    /// A read sent while polling this round has reported Displayed.
+    bool m_optInRoundSawDisplayed = false;
+    /// An older CancelOptIn was answered during this round, so it may
+    /// have landed after this round's StartOptIn.
+    bool m_optInRoundCancelRaced = false;
+    /// An operation's outcome is ambiguous, so re-read the firmware once
+    /// nothing else is on the wire.
+    bool m_optInRereadPending = false;
+    int m_optInRereads = 0;     ///< Since the last `resetOptInAttempts`.
+    void endOptInRoundOp();
+    void endOptInRound();
+    void requestOptInReread();
+    void flushOptInReread();
     /// Set once `getOptInStatus` has returned successfully.
     bool m_optInStatusKnown = false;
     void setOptInRoundActive(bool v);
