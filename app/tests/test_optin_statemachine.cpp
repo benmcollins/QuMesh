@@ -19,9 +19,12 @@
 
 #include "machinedetailscontroller.h"
 
+#include <QPointer>
 #include <QTcpServer>
 #include <QTcpSocket>
 #include <QtTest>
+
+#include <utility>
 
 using qumesh::app::MachineDetailsController;
 
@@ -39,7 +42,17 @@ public:
     quint32 optInRequired = 1;
     quint32 sendCodeReturnValue = 0;
     quint32 startOptInReturnValue = 0;
+    quint32 cancelReturnValue = 0;
+    int startOptInState = 2;   ///< Where an accepted StartOptIn lands.
     QStringList calls;         ///< method names, in order
+
+    ~FakeAmt() override
+    {
+        // m_buffers dies before m_server, whose child sockets emit
+        // disconnected as they are destroyed.
+        const auto sockets = m_server.findChildren<QTcpSocket *>();
+        for (QTcpSocket *sock : sockets) sock->disconnect(this);
+    }
 
     bool listen()
     {
@@ -51,6 +64,29 @@ public:
     [[nodiscard]] int countOf(const QString &method) const
     {
         return static_cast<int>(std::count(calls.cbegin(), calls.cend(), method));
+    }
+
+    /// Withhold the reply to the next `IPS_OptInService` read, reporting
+    /// `staleState` when it is released: a read the firmware answered
+    /// before a consent operation changed its state.
+    void holdNextStatusRead(int staleState)
+    {
+        m_holdNextStatusRead = true;
+        m_staleState = staleState;
+    }
+    /// Apply the next call to `method` but withhold its reply.
+    void holdNextReplyTo(const QByteArray &method) { m_holdMethod = method; }
+    [[nodiscard]] int heldReplies() const { return static_cast<int>(m_held.size()); }
+    [[nodiscard]] bool holdingReply() const { return !m_held.isEmpty(); }
+    /// Release a held reply, the oldest by default.
+    void releaseHeldReply(int index = 0)
+    {
+        if (index >= m_held.size()) return;
+        const Held held = m_held.takeAt(index);
+        if (held.socket.isNull()) return;
+        held.socket->write(held.reply);
+        held.socket->flush();
+        held.socket->disconnectFromHost();
     }
 
 private slots:
@@ -90,11 +126,31 @@ private:
         const QByteArray body = buf.mid(bodyStart, contentLength);
         buf.remove(0, bodyStart + contentLength);
 
+        if (m_holdNextStatusRead && isStatusRead(body)) {
+            m_holdNextStatusRead = false;
+            const int liveState = std::exchange(optInState, m_staleState);
+            m_held.append({ sock, respond(body) });
+            optInState = liveState;
+            return;
+        }
+        if (!m_holdMethod.isEmpty() && body.contains(m_holdMethod)) {
+            m_holdMethod.clear();
+            m_held.append({ sock, respond(body) });
+            return;
+        }
+
         sock->write(respond(body));
         sock->flush();
         // The client sends `Connection: close`; honour it so each
         // request gets its own connection exactly as against real AMT.
         sock->disconnectFromHost();
+    }
+
+    static bool isStatusRead(const QByteArray &body)
+    {
+        return !body.contains("StartOptIn") && !body.contains("SendOptInCode")
+            && !body.contains("CancelOptIn")
+            && !body.contains("IPS_KVMRedirectionSettingData");
     }
 
     QByteArray respond(const QByteArray &body)
@@ -103,7 +159,7 @@ private:
         if (body.contains("StartOptIn")) {
             calls << QStringLiteral("StartOptIn");
             // Real firmware puts a code on the target's screen here.
-            if (startOptInReturnValue == 0) optInState = 2; // DISPLAYED
+            if (startOptInReturnValue == 0) optInState = startOptInState;
             payload = invokeReply("StartOptIn", startOptInReturnValue);
         } else if (body.contains("SendOptInCode")) {
             calls << QStringLiteral("SendOptInCode");
@@ -111,8 +167,8 @@ private:
             payload = invokeReply("SendOptInCode", sendCodeReturnValue);
         } else if (body.contains("CancelOptIn")) {
             calls << QStringLiteral("CancelOptIn");
-            optInState = 0;
-            payload = invokeReply("CancelOptIn", 0);
+            if (cancelReturnValue == 0) optInState = 0;
+            payload = invokeReply("CancelOptIn", cancelReturnValue);
         } else if (body.contains("IPS_KVMRedirectionSettingData")) {
             calls << QStringLiteral("GetKvmSettings");
             payload = kvmSettingsReply();
@@ -166,6 +222,14 @@ private:
 
     QTcpServer m_server;
     QHash<QTcpSocket *, QByteArray> m_buffers;
+    QByteArray m_holdMethod;
+    bool m_holdNextStatusRead = false;
+    int m_staleState = 0;
+    struct Held {
+        QPointer<QTcpSocket> socket;
+        QByteArray reply;
+    };
+    QList<Held> m_held;
 };
 
 /// Pump the event loop for `ms` with no success condition — used to
@@ -212,6 +276,35 @@ private slots:
     void repeatedStartFailuresGiveUpInsteadOfLooping();
     void rejectedCodeKeepsRoundOpen();
     void unreadableStatusResolvesToNotRequired();
+    // A status read that predates a consent operation must not undo it.
+    void staleReadDoesNotUndoGrantedConsent();
+    void staleReadDoesNotRestoreCancelledConsent();
+    void staleReadDoesNotEndNewRound();
+    void requestedStateIsNotAnExpiry();
+    void failedCancelRereadsFirmware();
+    void acceptedCodeSurvivesFailedCancel();
+    void readSpanningCancelAndStartDoesNotGrant();
+    void lateRejectionAfterGrantStaysSilent();
+    void requestedAfterLocalDisplayedIsNotExpiry();
+    void displayedFromEarlierRoundDoesNotCarryOver();
+    void displayedReadFromEndedRoundDoesNotCount();
+    void refusedCancelRereadsAreCapped();
+    void readLandingBeforeCancelReplyIsIgnored();
+    void readLandingAfterCancelReplyIsIgnored();
+    void staleReadDoesNotGrantNewRound();
+    void lateAcceptedCodeAfterCancelRereads();
+    void refusedCancelNeverExposesNotStarted();
+    void lostCodeReplyIsGrantedByPoll();
+    void overlappedDisplayedReadStillDetectsExpiry();
+    void supersededCancelRereadsFirmware();
+    void cancelLandingAfterStartEndsDeadRound_data();
+    void cancelLandingAfterStartEndsDeadRound();
+    void racedCancelDoesNotCarryIntoNextRound();
+    void discardedRereadIsReplaced();
+    void rereadWaitsForOutstandingStart();
+    void lateCancelReplyDoesNotEraseNewConsent();
+    void lateCodeReplyDoesNotGrantCancelledRound();
+    void lateStartReplyDoesNotReviveCancelledRound();
     // #437 — OptInRequired is a tri-state, not a bool.
     void kvmOnlyPolicyDoesNotGateSolOrIder();
     void alwaysRequiredPolicyGatesEveryProtocol();
@@ -423,6 +516,821 @@ void TestOptInStateMachine::unreadableStatusResolvesToNotRequired()
               "an unreadable consent policy must not block redirection");
 }
 
+void TestOptInStateMachine::staleReadDoesNotUndoGrantedConsent()
+{
+    FakeAmt amt;
+    QVERIFY(amt.listen());
+
+    MachineDetailsController c;
+    aim(c, amt);
+
+    QSignalSpy startedSpy(&c, &MachineDetailsController::optInStarted);
+    QSignalSpy codeSpy(&c, &MachineDetailsController::optInCodeResult);
+
+    amt.holdNextStatusRead(2);  // answered while the code was on screen
+    c.startOptIn();
+    QVERIFY(waitFor(5000, [&]() { return startedSpy.size() == 1; }));
+    QVERIFY(waitFor(5000, [&]() { return amt.holdingReply(); }));
+
+    c.sendOptInCode(123456);
+    QVERIFY(waitFor(5000, [&]() { return codeSpy.size() == 1; }));
+    QVERIFY(codeSpy.first().at(0).toBool());
+    QCOMPARE(c.optInState(), 3);
+
+    QSignalSpy statusSpy(&c, &MachineDetailsController::optInStatusChanged);
+    amt.releaseHeldReply();
+    QVERIFY(waitFor(5000, [&]() { return statusSpy.size() >= 1; }));
+
+    QCOMPARE(c.optInState(), 3);
+    QVERIFY(c.optInSatisfied());
+}
+
+void TestOptInStateMachine::staleReadDoesNotRestoreCancelledConsent()
+{
+    FakeAmt amt;
+    QVERIFY(amt.listen());
+
+    MachineDetailsController c;
+    aim(c, amt);
+
+    QSignalSpy startedSpy(&c, &MachineDetailsController::optInStarted);
+    QSignalSpy grantedSpy(&c, &MachineDetailsController::optInGranted);
+
+    amt.holdNextStatusRead(3);  // answered before the operator cancelled
+    c.startOptIn();
+    QVERIFY(waitFor(5000, [&]() { return startedSpy.size() == 1; }));
+    QVERIFY(waitFor(5000, [&]() { return amt.holdingReply(); }));
+
+    QSignalSpy cancelSpy(&c, &MachineDetailsController::optInStatusChanged);
+    c.cancelOptIn();
+    QVERIFY(waitFor(5000, [&]() { return cancelSpy.size() == 1; }));
+    QCOMPARE(c.optInState(), 0);
+
+    QSignalSpy statusSpy(&c, &MachineDetailsController::optInStatusChanged);
+    amt.releaseHeldReply();
+    QVERIFY(waitFor(5000, [&]() { return statusSpy.size() >= 1; }));
+
+    QCOMPARE(c.optInState(), 0);
+    QVERIFY2(!c.optInSatisfied(), "a cancelled consent must not read as granted");
+    QCOMPARE(grantedSpy.size(), 0);
+}
+
+void TestOptInStateMachine::staleReadDoesNotEndNewRound()
+{
+    FakeAmt amt;
+    amt.optInState = 2;
+    QVERIFY(amt.listen());
+
+    MachineDetailsController c;
+    aim(c, amt);
+    c.refreshOptInStatus();
+    QVERIFY(waitFor(5000, [&]() { return c.optInState() == 2; }));
+
+    QSignalSpy startedSpy(&c, &MachineDetailsController::optInStarted);
+    QSignalSpy expiredSpy(&c, &MachineDetailsController::optInExpiredOrDenied);
+
+    amt.holdNextStatusRead(0);  // answered before StartOptIn reached AMT
+    c.refreshOptInStatus();
+    QVERIFY(waitFor(5000, [&]() { return amt.holdingReply(); }));
+
+    c.startOptIn();
+    QVERIFY(waitFor(5000, [&]() { return startedSpy.size() == 1; }));
+
+    QSignalSpy statusSpy(&c, &MachineDetailsController::optInStatusChanged);
+    amt.releaseHeldReply();
+    QVERIFY(waitFor(5000, [&]() { return statusSpy.size() >= 1; }));
+
+    QCOMPARE(expiredSpy.size(), 0);
+    QVERIFY2(c.optInRoundActive(), "a stale read must not end the round just started");
+}
+
+
+void TestOptInStateMachine::requestedStateIsNotAnExpiry()
+{
+    FakeAmt amt;
+    amt.startOptInState = 1;    // Requested: not on the target's screen yet
+    QVERIFY(amt.listen());
+
+    MachineDetailsController c;
+    aim(c, amt);
+
+    QSignalSpy startedSpy(&c, &MachineDetailsController::optInStarted);
+    QSignalSpy expiredSpy(&c, &MachineDetailsController::optInExpiredOrDenied);
+
+    c.startOptIn();
+    QVERIFY(waitFor(5000, [&]() { return startedSpy.size() == 1; }));
+    QVERIFY(waitFor(5000, [&]() { return c.optInState() == 1; }));
+    QCOMPARE(expiredSpy.size(), 0);
+    QVERIFY(c.optInRoundActive());
+
+    amt.optInState = 2;
+    QVERIFY(waitFor(5000, [&]() { return c.optInState() == 2; }));
+    QCOMPARE(expiredSpy.size(), 0);
+
+    amt.optInState = 0;     // the code timed out on the target
+    QVERIFY2(waitFor(5000, [&]() { return expiredSpy.size() == 1; }),
+             "a drop after Displayed must end the round");
+    QVERIFY(!c.optInRoundActive());
+}
+
+void TestOptInStateMachine::failedCancelRereadsFirmware()
+{
+    FakeAmt amt;
+    amt.cancelReturnValue = 1;
+    QVERIFY(amt.listen());
+
+    MachineDetailsController c;
+    aim(c, amt);
+
+    QSignalSpy startedSpy(&c, &MachineDetailsController::optInStarted);
+    amt.holdNextStatusRead(2);
+    c.startOptIn();
+    QVERIFY(waitFor(5000, [&]() { return startedSpy.size() == 1; }));
+    QVERIFY(waitFor(5000, [&]() { return amt.holdingReply(); }));
+
+    c.cancelOptIn();
+    QVERIFY(waitFor(5000, [&]() { return amt.countOf("CancelOptIn") == 1; }));
+    settle(100);
+
+    // The target approved while the refused cancel was on the wire. Only
+    // a read started after the cancel can report it.
+    amt.optInState = 3;
+    amt.releaseHeldReply();
+    QVERIFY2(waitFor(5000, [&]() { return c.optInState() == 3; }),
+             "a refused cancel must be followed by a fresh read");
+}
+
+void TestOptInStateMachine::acceptedCodeSurvivesFailedCancel()
+{
+    FakeAmt amt;
+    amt.cancelReturnValue = 1;
+    QVERIFY(amt.listen());
+
+    MachineDetailsController c;
+    aim(c, amt);
+
+    QSignalSpy startedSpy(&c, &MachineDetailsController::optInStarted);
+    QSignalSpy codeSpy(&c, &MachineDetailsController::optInCodeResult);
+
+    c.startOptIn();
+    QVERIFY(waitFor(5000, [&]() { return startedSpy.size() == 1; }));
+
+    amt.holdNextReplyTo("SendOptInCode");
+    c.sendOptInCode(123456);
+    QVERIFY(waitFor(5000, [&]() { return amt.holdingReply(); }));
+
+    c.cancelOptIn();
+    QVERIFY(waitFor(5000, [&]() { return amt.countOf("CancelOptIn") == 1; }));
+    settle(100);
+
+    amt.releaseHeldReply();
+    QVERIFY(waitFor(5000, [&]() { return c.optInState() == 3; }));
+    QCOMPARE(amt.optInState, 3);
+    QVERIFY(c.optInSatisfied());
+    QVERIFY2(codeSpy.isEmpty(), "the operator cancelled, so no session may be released");
+}
+
+void TestOptInStateMachine::readSpanningCancelAndStartDoesNotGrant()
+{
+    FakeAmt amt;
+    amt.optInState = 2;
+    QVERIFY(amt.listen());
+
+    MachineDetailsController c;
+    aim(c, amt);
+    c.refreshOptInStatus();
+    QVERIFY(waitFor(5000, [&]() { return c.optInState() == 2; }));
+
+    QSignalSpy startedSpy(&c, &MachineDetailsController::optInStarted);
+
+    amt.holdNextStatusRead(3);  // answered before the round was torn down
+    c.refreshOptInStatus();
+    QVERIFY(waitFor(5000, [&]() { return amt.heldReplies() == 1; }));
+
+    // SessionWindow replaces a stale round with these two calls.
+    amt.holdNextReplyTo("StartOptIn");
+    c.cancelOptIn();
+    c.startOptIn();
+    QVERIFY(waitFor(5000, [&]() { return amt.heldReplies() == 2; }));
+    QVERIFY(waitFor(5000, [&]() { return amt.countOf("CancelOptIn") == 1; }));
+
+    QSignalSpy statusSpy(&c, &MachineDetailsController::optInStatusChanged);
+    amt.releaseHeldReply();     // the stale read
+    QVERIFY(waitFor(5000, [&]() { return amt.countOf("GetKvmSettings") >= 2; }));
+    settle(100);
+    QVERIFY(statusSpy.size() >= 1);
+    QVERIFY2(c.optInState() != 3 && !c.optInSatisfied(),
+             "a read from before the cancel must not release a session");
+
+    amt.releaseHeldReply();     // StartOptIn
+    QVERIFY(waitFor(5000, [&]() { return startedSpy.size() == 1; }));
+    QVERIFY(c.optInRoundActive());
+    QVERIFY(!c.optInSatisfied());
+}
+
+void TestOptInStateMachine::lateRejectionAfterGrantStaysSilent()
+{
+    FakeAmt amt;
+    QVERIFY(amt.listen());
+
+    MachineDetailsController c;
+    aim(c, amt);
+
+    QSignalSpy startedSpy(&c, &MachineDetailsController::optInStarted);
+    QSignalSpy codeSpy(&c, &MachineDetailsController::optInCodeResult);
+    QSignalSpy rejectedSpy(&c, &MachineDetailsController::optInCodeRejected);
+
+    c.startOptIn();
+    QVERIFY(waitFor(5000, [&]() { return startedSpy.size() == 1; }));
+
+    amt.sendCodeReturnValue = 1;
+    amt.holdNextReplyTo("SendOptInCode");
+    c.sendOptInCode(111111);
+    QVERIFY(waitFor(5000, [&]() { return amt.holdingReply(); }));
+
+    amt.sendCodeReturnValue = 0;
+    c.sendOptInCode(123456);
+    QVERIFY(waitFor(5000, [&]() { return codeSpy.size() == 1; }));
+    QVERIFY(codeSpy.first().at(0).toBool());
+
+    amt.releaseHeldReply();
+    QVERIFY(waitFor(5000, [&]() { return !c.busy(); }));
+    QVERIFY2(rejectedSpy.isEmpty(), "a rejection would reopen the dialog over the session");
+    QCOMPARE(codeSpy.size(), 1);
+    QCOMPARE(c.optInState(), 3);
+}
+
+void TestOptInStateMachine::lateCancelReplyDoesNotEraseNewConsent()
+{
+    FakeAmt amt;
+    QVERIFY(amt.listen());
+
+    MachineDetailsController c;
+    aim(c, amt);
+
+    QSignalSpy startedSpy(&c, &MachineDetailsController::optInStarted);
+    QSignalSpy codeSpy(&c, &MachineDetailsController::optInCodeResult);
+
+    c.startOptIn();
+    QVERIFY(waitFor(5000, [&]() { return startedSpy.size() == 1; }));
+
+    // SessionWindow tears down a stale round and starts the next at once.
+    amt.holdNextReplyTo("CancelOptIn");
+    c.cancelOptIn();
+    QVERIFY(waitFor(5000, [&]() { return amt.holdingReply(); }));
+    c.startOptIn();
+    QVERIFY(waitFor(5000, [&]() { return startedSpy.size() == 2; }));
+
+    c.sendOptInCode(123456);
+    QVERIFY(waitFor(5000, [&]() { return codeSpy.size() == 1; }));
+    QCOMPARE(c.optInState(), 3);
+
+    amt.releaseHeldReply();
+    settle(200);
+    QCOMPARE(amt.optInState, 3);
+    QCOMPARE(c.optInState(), 3);
+    QVERIFY(c.optInSatisfied());
+}
+
+void TestOptInStateMachine::lateCodeReplyDoesNotGrantCancelledRound()
+{
+    FakeAmt amt;
+    QVERIFY(amt.listen());
+
+    MachineDetailsController c;
+    aim(c, amt);
+
+    QSignalSpy startedSpy(&c, &MachineDetailsController::optInStarted);
+    QSignalSpy codeSpy(&c, &MachineDetailsController::optInCodeResult);
+
+    // Learn the policy first: with none known, everything reads as satisfied.
+    c.refreshOptInStatus();
+    QVERIFY(waitFor(5000, [&]() { return c.optInStatusKnown(); }));
+
+    c.startOptIn();
+    QVERIFY(waitFor(5000, [&]() { return startedSpy.size() == 1; }));
+
+    amt.holdNextReplyTo("SendOptInCode");
+    c.sendOptInCode(123456);
+    QVERIFY(waitFor(5000, [&]() { return amt.holdingReply(); }));
+
+    QSignalSpy cancelSpy(&c, &MachineDetailsController::optInStatusChanged);
+    c.cancelOptIn();
+    QVERIFY(waitFor(5000, [&]() { return cancelSpy.size() >= 1 && c.optInState() == 0; }));
+
+    amt.releaseHeldReply();
+    QVERIFY(waitFor(5000, [&]() { return !c.busy(); }));
+    QCOMPARE(amt.optInState, 0);
+    QCOMPARE(c.optInState(), 0);
+    QVERIFY2(!c.optInSatisfied(), "a cancelled round must not read as granted");
+    QVERIFY2(codeSpy.isEmpty(), "optInCodeResult releases the waiting session");
+}
+
+void TestOptInStateMachine::lateStartReplyDoesNotReviveCancelledRound()
+{
+    FakeAmt amt;
+    QVERIFY(amt.listen());
+
+    MachineDetailsController c;
+    aim(c, amt);
+
+    QSignalSpy startedSpy(&c, &MachineDetailsController::optInStarted);
+
+    amt.holdNextReplyTo("StartOptIn");
+    c.startOptIn();
+    QVERIFY(waitFor(5000, [&]() { return amt.holdingReply(); }));
+
+    QSignalSpy cancelSpy(&c, &MachineDetailsController::optInStatusChanged);
+    c.cancelOptIn();
+    QVERIFY(waitFor(5000, [&]() { return cancelSpy.size() == 1; }));
+
+    amt.releaseHeldReply();
+    settle(700);    // longer than the 500 ms poll interval
+
+    QVERIFY2(startedSpy.isEmpty(), "optInStarted opens the consent dialog");
+    QVERIFY(!c.optInRoundActive());
+    QCOMPARE(c.optInState(), 0);
+    QCOMPARE(amt.countOf("GetOptInService"), 0);
+}
+
+void TestOptInStateMachine::requestedAfterLocalDisplayedIsNotExpiry()
+{
+    FakeAmt amt;
+    amt.optInState = 2;
+    QVERIFY(amt.listen());
+
+    MachineDetailsController c;
+    aim(c, amt);
+    c.refreshOptInStatus();
+    QVERIFY(waitFor(5000, [&]() { return c.optInState() == 2; }));
+
+    QSignalSpy startedSpy(&c, &MachineDetailsController::optInStarted);
+    QSignalSpy expiredSpy(&c, &MachineDetailsController::optInExpiredOrDenied);
+
+    amt.startOptInState = 1;
+    amt.holdNextReplyTo("CancelOptIn");
+    c.cancelOptIn();
+    QVERIFY(waitFor(5000, [&]() { return amt.holdingReply(); }));
+    c.startOptIn();
+    QVERIFY(waitFor(5000, [&]() { return startedSpy.size() == 1; }));
+
+    amt.releaseHeldReply();
+    QVERIFY(waitFor(5000, [&]() { return c.optInState() == 1; }));
+    settle(700);    // longer than the 500 ms poll interval
+    QCOMPARE(expiredSpy.size(), 0);
+    QVERIFY(c.optInRoundActive());
+}
+
+void TestOptInStateMachine::displayedFromEarlierRoundDoesNotCarryOver()
+{
+    FakeAmt amt;
+    QVERIFY(amt.listen());
+
+    MachineDetailsController c;
+    aim(c, amt);
+
+    QSignalSpy startedSpy(&c, &MachineDetailsController::optInStarted);
+    QSignalSpy expiredSpy(&c, &MachineDetailsController::optInExpiredOrDenied);
+
+    c.startOptIn();
+    QVERIFY(waitFor(5000, [&]() { return c.optInState() == 2; }));
+
+    c.cancelOptIn();
+    QVERIFY(waitFor(5000, [&]() { return c.optInState() == 0; }));
+
+    amt.startOptInState = 1;
+    c.startOptIn();
+    QVERIFY(waitFor(5000, [&]() { return startedSpy.size() == 2; }));
+    QVERIFY(waitFor(5000, [&]() { return c.optInState() == 1; }));
+    settle(700);
+    QCOMPARE(expiredSpy.size(), 0);
+    QVERIFY(c.optInRoundActive());
+}
+
+void TestOptInStateMachine::displayedReadFromEndedRoundDoesNotCount()
+{
+    FakeAmt amt;
+    QVERIFY(amt.listen());
+
+    MachineDetailsController c;
+    aim(c, amt);
+
+    QSignalSpy startedSpy(&c, &MachineDetailsController::optInStarted);
+    QSignalSpy expiredSpy(&c, &MachineDetailsController::optInExpiredOrDenied);
+
+    amt.holdNextStatusRead(2);
+    c.startOptIn();
+    QVERIFY(waitFor(5000, [&]() { return startedSpy.size() == 1; }));
+    QVERIFY(waitFor(5000, [&]() { return amt.holdingReply(); }));
+
+    c.cancelOptIn();
+    QVERIFY(waitFor(5000, [&]() { return amt.countOf("CancelOptIn") == 1; }));
+    settle(100);
+
+    amt.startOptInState = 1;
+    c.startOptIn();
+    QVERIFY(waitFor(5000, [&]() { return startedSpy.size() == 2; }));
+
+    amt.releaseHeldReply();     // Displayed, but from the cancelled round
+    QVERIFY(waitFor(5000, [&]() { return c.optInState() == 1; }));
+    settle(700);
+    QCOMPARE(expiredSpy.size(), 0);
+    QVERIFY(c.optInRoundActive());
+}
+
+void TestOptInStateMachine::refusedCancelRereadsAreCapped()
+{
+    FakeAmt amt;
+    amt.optInState = 2;
+    amt.cancelReturnValue = 1;
+    amt.startOptInReturnValue = 1;
+    QVERIFY(amt.listen());
+
+    MachineDetailsController c;
+    aim(c, amt);
+    c.refreshOptInStatus();
+    QVERIFY(waitFor(5000, [&]() { return c.optInState() == 2; }));
+
+    // What SessionWindow::driveConsent does on every status change.
+    const auto drive = [&]() {
+        if (c.optInRoundActive()) return;
+        if (c.optInState() == 2) c.cancelOptIn();
+        c.startOptIn();
+    };
+    QObject::connect(&c, &MachineDetailsController::optInStatusChanged, &c, drive);
+
+    c.resetOptInAttempts();
+    drive();
+    settle(1500);
+    const int readsAfterFirst = amt.countOf("GetOptInService");
+    QVERIFY2(amt.countOf("CancelOptIn") <= 4,
+             qPrintable(QStringLiteral("%1 CancelOptIn calls").arg(amt.countOf("CancelOptIn"))));
+    QVERIFY2(readsAfterFirst <= 4, qPrintable(QStringLiteral("%1 reads").arg(readsAfterFirst)));
+
+    // The cap is per Connect.
+    c.resetOptInAttempts();
+    drive();
+    settle(1000);
+    const int moreReads = amt.countOf("GetOptInService") - readsAfterFirst;
+    QVERIFY2(moreReads >= 1 && moreReads <= 3,
+             qPrintable(QStringLiteral("%1 reads after reset").arg(moreReads)));
+}
+
+void TestOptInStateMachine::readLandingBeforeCancelReplyIsIgnored()
+{
+    FakeAmt amt;
+    amt.optInState = 2;
+    QVERIFY(amt.listen());
+
+    MachineDetailsController c;
+    aim(c, amt);
+    c.refreshOptInStatus();
+    QVERIFY(waitFor(5000, [&]() { return c.optInState() == 2; }));
+
+    amt.holdNextReplyTo("CancelOptIn");
+    c.cancelOptIn();
+    QVERIFY(waitFor(5000, [&]() { return amt.heldReplies() == 1; }));
+    amt.holdNextStatusRead(3);
+    c.refreshOptInStatus();
+    QVERIFY(waitFor(5000, [&]() { return amt.heldReplies() == 2; }));
+
+    QSignalSpy statusSpy(&c, &MachineDetailsController::optInStatusChanged);
+    amt.releaseHeldReply(1);    // the read, while the cancel is unanswered
+    QVERIFY(waitFor(5000, [&]() { return statusSpy.size() >= 1; }));
+    QCOMPARE(c.optInState(), 2);
+
+    amt.releaseHeldReply();
+    QVERIFY(waitFor(5000, [&]() { return c.optInState() == 0; }));
+    QVERIFY(!c.optInSatisfied());
+}
+
+void TestOptInStateMachine::readLandingAfterCancelReplyIsIgnored()
+{
+    FakeAmt amt;
+    amt.optInState = 2;
+    QVERIFY(amt.listen());
+
+    MachineDetailsController c;
+    aim(c, amt);
+    c.refreshOptInStatus();
+    QVERIFY(waitFor(5000, [&]() { return c.optInState() == 2; }));
+
+    amt.holdNextReplyTo("CancelOptIn");
+    c.cancelOptIn();
+    QVERIFY(waitFor(5000, [&]() { return amt.heldReplies() == 1; }));
+    amt.holdNextStatusRead(3);
+    c.refreshOptInStatus();
+    QVERIFY(waitFor(5000, [&]() { return amt.heldReplies() == 2; }));
+
+    amt.releaseHeldReply();     // the cancel
+    QVERIFY(waitFor(5000, [&]() { return c.optInState() == 0; }));
+
+    QSignalSpy statusSpy(&c, &MachineDetailsController::optInStatusChanged);
+    amt.releaseHeldReply();     // the read that was sent before it landed
+    QVERIFY(waitFor(5000, [&]() { return statusSpy.size() >= 1; }));
+    QCOMPARE(c.optInState(), 0);
+    QVERIFY(!c.optInSatisfied());
+}
+
+void TestOptInStateMachine::staleReadDoesNotGrantNewRound()
+{
+    FakeAmt amt;
+    amt.optInState = 3;
+    QVERIFY(amt.listen());
+
+    MachineDetailsController c;
+    aim(c, amt);
+    c.refreshOptInStatus();
+    QVERIFY(waitFor(5000, [&]() { return c.optInState() == 3; }));
+
+    QSignalSpy startedSpy(&c, &MachineDetailsController::optInStarted);
+    QSignalSpy grantedSpy(&c, &MachineDetailsController::optInGranted);
+
+    amt.holdNextStatusRead(3);
+    c.refreshOptInStatus();
+    QVERIFY(waitFor(5000, [&]() { return amt.holdingReply(); }));
+
+    c.startOptIn();
+    QVERIFY(waitFor(5000, [&]() { return startedSpy.size() == 1; }));
+
+    QSignalSpy statusSpy(&c, &MachineDetailsController::optInStatusChanged);
+    amt.releaseHeldReply();
+    QVERIFY(waitFor(5000, [&]() { return statusSpy.size() >= 1; }));
+    QCOMPARE(grantedSpy.size(), 0);
+    QVERIFY(c.optInRoundActive());
+}
+
+void TestOptInStateMachine::lateAcceptedCodeAfterCancelRereads()
+{
+    FakeAmt amt;
+    QVERIFY(amt.listen());
+
+    MachineDetailsController c;
+    aim(c, amt);
+
+    QSignalSpy startedSpy(&c, &MachineDetailsController::optInStarted);
+    QSignalSpy codeSpy(&c, &MachineDetailsController::optInCodeResult);
+
+    c.startOptIn();
+    QVERIFY(waitFor(5000, [&]() { return startedSpy.size() == 1; }));
+
+    amt.holdNextReplyTo("SendOptInCode");
+    c.sendOptInCode(123456);
+    QVERIFY(waitFor(5000, [&]() { return amt.holdingReply(); }));
+
+    QSignalSpy cancelSpy(&c, &MachineDetailsController::optInStatusChanged);
+    c.cancelOptIn();
+    QVERIFY(waitFor(5000, [&]() { return cancelSpy.size() >= 1 && c.optInState() == 0; }));
+
+    amt.optInState = 3;     // the code landed after the cancel
+    amt.releaseHeldReply();
+    QVERIFY2(waitFor(5000, [&]() { return c.optInState() == 3; }),
+             "an accepted code for an ended round must trigger a fresh read");
+    QVERIFY2(codeSpy.isEmpty(), "the operator cancelled, so no session may be released");
+}
+
+void TestOptInStateMachine::refusedCancelNeverExposesNotStarted()
+{
+    FakeAmt amt;
+    amt.optInState = 2;
+    amt.cancelReturnValue = 1;
+    QVERIFY(amt.listen());
+
+    MachineDetailsController c;
+    aim(c, amt);
+    c.refreshOptInStatus();
+    QVERIFY(waitFor(5000, [&]() { return c.optInState() == 2; }));
+
+    QList<int> seen;
+    QObject::connect(&c, &MachineDetailsController::optInStatusChanged, &c,
+                     [&]() { seen.append(c.optInState()); });
+
+    c.cancelOptIn();
+    QVERIFY(waitFor(5000, [&]() { return !seen.isEmpty(); }));
+    settle(200);
+    QVERIFY2(!seen.contains(0), "a refused cancel must not report NotStarted");
+    QCOMPARE(c.optInState(), 2);
+}
+
+void TestOptInStateMachine::lostCodeReplyIsGrantedByPoll()
+{
+    FakeAmt amt;
+    QVERIFY(amt.listen());
+
+    MachineDetailsController c;
+    aim(c, amt);
+
+    QSignalSpy grantedSpy(&c, &MachineDetailsController::optInGranted);
+    QSignalSpy codeSpy(&c, &MachineDetailsController::optInCodeResult);
+
+    c.startOptIn();
+    QVERIFY(waitFor(5000, [&]() { return c.optInState() == 2; }));
+
+    amt.holdNextReplyTo("SendOptInCode");
+    c.sendOptInCode(123456);
+    QVERIFY(waitFor(5000, [&]() { return amt.holdingReply(); }));
+
+    QVERIFY2(waitFor(3000, [&]() { return grantedSpy.size() == 1; }),
+             "a poll must report the grant while the code reply is missing");
+    QCOMPARE(c.optInState(), 3);
+    QVERIFY(!c.optInRoundActive());
+
+    amt.releaseHeldReply();
+    settle(200);
+    QCOMPARE(grantedSpy.size(), 1);
+    QVERIFY2(codeSpy.isEmpty(), "the session was already released by the poll");
+}
+
+void TestOptInStateMachine::overlappedDisplayedReadStillDetectsExpiry()
+{
+    FakeAmt amt;
+    QVERIFY(amt.listen());
+
+    MachineDetailsController c;
+    aim(c, amt);
+
+    QSignalSpy startedSpy(&c, &MachineDetailsController::optInStarted);
+    QSignalSpy codeSpy(&c, &MachineDetailsController::optInCodeResult);
+    QSignalSpy expiredSpy(&c, &MachineDetailsController::optInExpiredOrDenied);
+
+    amt.holdNextStatusRead(2);
+    c.startOptIn();
+    QVERIFY(waitFor(5000, [&]() { return startedSpy.size() == 1; }));
+    QVERIFY(waitFor(5000, [&]() { return amt.holdingReply(); }));
+
+    amt.sendCodeReturnValue = 1;
+    c.sendOptInCode(111111);
+    QVERIFY(waitFor(5000, [&]() { return codeSpy.size() == 1; }));
+
+    amt.optInState = 0;     // the code timed out on the target
+    amt.releaseHeldReply();
+    QVERIFY2(waitFor(5000, [&]() { return expiredSpy.size() == 1; }),
+             "a discarded read still proves the round reached Displayed");
+    QVERIFY(!c.optInRoundActive());
+}
+
+void TestOptInStateMachine::supersededCancelRereadsFirmware()
+{
+    FakeAmt amt;
+    QVERIFY(amt.listen());
+
+    MachineDetailsController c;
+    aim(c, amt);
+
+    QSignalSpy startedSpy(&c, &MachineDetailsController::optInStarted);
+    QSignalSpy codeSpy(&c, &MachineDetailsController::optInCodeResult);
+
+    c.startOptIn();
+    QVERIFY(waitFor(5000, [&]() { return startedSpy.size() == 1; }));
+
+    amt.holdNextReplyTo("CancelOptIn");
+    c.cancelOptIn();
+    QVERIFY(waitFor(5000, [&]() { return amt.holdingReply(); }));
+    c.startOptIn();
+    QVERIFY(waitFor(5000, [&]() { return startedSpy.size() == 2; }));
+    c.sendOptInCode(123456);
+    QVERIFY(waitFor(5000, [&]() { return codeSpy.size() == 1; }));
+    QCOMPARE(c.optInState(), 3);
+
+    amt.optInState = 0;     // the delayed cancel took effect last
+    amt.releaseHeldReply();
+    QVERIFY2(waitFor(5000, [&]() { return c.optInState() == 0; }),
+             "a superseded cancel must be followed by a fresh read");
+    QVERIFY(!c.optInSatisfied());
+}
+
+void TestOptInStateMachine::cancelLandingAfterStartEndsDeadRound_data()
+{
+    QTest::addColumn<bool>("pollWhileCancelUnanswered");
+    QTest::newRow("cancel reply before first poll") << false;
+    QTest::newRow("cancel reply after polls") << true;
+}
+
+void TestOptInStateMachine::cancelLandingAfterStartEndsDeadRound()
+{
+    QFETCH(bool, pollWhileCancelUnanswered);
+
+    FakeAmt amt;
+    amt.optInState = 2;
+    QVERIFY(amt.listen());
+
+    MachineDetailsController c;
+    aim(c, amt);
+    c.refreshOptInStatus();
+    QVERIFY(waitFor(5000, [&]() { return c.optInState() == 2; }));
+
+    QSignalSpy startedSpy(&c, &MachineDetailsController::optInStarted);
+    QSignalSpy expiredSpy(&c, &MachineDetailsController::optInExpiredOrDenied);
+
+    amt.holdNextReplyTo("CancelOptIn");
+    c.cancelOptIn();
+    QVERIFY(waitFor(5000, [&]() { return amt.holdingReply(); }));
+    c.startOptIn();
+    QVERIFY(waitFor(5000, [&]() { return startedSpy.size() == 1; }));
+
+    amt.optInState = 0;     // the cancel took effect after the start
+    if (pollWhileCancelUnanswered) settle(700);
+    amt.releaseHeldReply();
+
+    QVERIFY2(waitFor(5000, [&]() { return expiredSpy.size() == 1; }),
+             "a round whose code was cancelled must not keep its dialog open");
+    QVERIFY(!c.optInRoundActive());
+    QCOMPARE(c.optInState(), 0);
+}
+
+void TestOptInStateMachine::racedCancelDoesNotCarryIntoNextRound()
+{
+    FakeAmt amt;
+    amt.optInState = 2;
+    QVERIFY(amt.listen());
+
+    MachineDetailsController c;
+    aim(c, amt);
+    c.refreshOptInStatus();
+    QVERIFY(waitFor(5000, [&]() { return c.optInState() == 2; }));
+
+    QSignalSpy startedSpy(&c, &MachineDetailsController::optInStarted);
+    QSignalSpy expiredSpy(&c, &MachineDetailsController::optInExpiredOrDenied);
+
+    amt.holdNextReplyTo("CancelOptIn");
+    c.cancelOptIn();
+    QVERIFY(waitFor(5000, [&]() { return amt.holdingReply(); }));
+    c.startOptIn();
+    QVERIFY(waitFor(5000, [&]() { return startedSpy.size() == 1; }));
+    amt.releaseHeldReply();     // an older cancel answered during this round
+    QVERIFY(waitFor(5000, [&]() { return !c.busy(); }));
+
+    c.cancelOptIn();
+    QVERIFY(waitFor(5000, [&]() { return c.optInState() == 0; }));
+    QVERIFY(waitFor(5000, [&]() { return !c.busy(); }));
+
+    // The next round has not left NotStarted yet. No cancel raced it.
+    amt.startOptInState = 0;
+    c.startOptIn();
+    QVERIFY(waitFor(5000, [&]() { return startedSpy.size() == 2; }));
+    settle(700);    // longer than the 500 ms poll interval
+    QCOMPARE(expiredSpy.size(), 0);
+    QVERIFY(c.optInRoundActive());
+}
+
+void TestOptInStateMachine::discardedRereadIsReplaced()
+{
+    FakeAmt amt;
+    amt.cancelReturnValue = 1;
+    QVERIFY(amt.listen());
+
+    MachineDetailsController c;
+    aim(c, amt);
+
+    c.startOptIn();
+    QVERIFY(waitFor(5000, [&]() { return c.optInState() == 2; }));
+
+    amt.sendCodeReturnValue = 1;
+    amt.holdNextReplyTo("SendOptInCode");
+    c.sendOptInCode(111111);
+    QVERIFY(waitFor(5000, [&]() { return amt.heldReplies() == 1; }));
+
+    // The reread after the refused cancel gets held too.
+    QVERIFY(waitFor(5000, [&]() { return c.optInStatusKnown(); }));
+    settle(50);
+    amt.holdNextStatusRead(2);
+    c.cancelOptIn();
+    QVERIFY(waitFor(5000, [&]() { return amt.heldReplies() == 2; }));
+
+    amt.optInState = 3;         // approved at the target
+    amt.releaseHeldReply();     // the rejected code, making the read stale
+    settle(100);
+    amt.releaseHeldReply();     // the read
+    QVERIFY2(waitFor(5000, [&]() { return c.optInState() == 3; }),
+             "a discarded read must be replaced when nothing is polling");
+}
+
+void TestOptInStateMachine::rereadWaitsForOutstandingStart()
+{
+    FakeAmt amt;
+    amt.optInState = 2;
+    amt.startOptInReturnValue = 1;
+    QVERIFY(amt.listen());
+
+    MachineDetailsController c;
+    aim(c, amt);
+    c.refreshOptInStatus();
+    QVERIFY(waitFor(5000, [&]() { return c.optInState() == 2; }));
+    const int readsBefore = amt.countOf("GetOptInService");
+
+    amt.holdNextReplyTo("StartOptIn");
+    c.cancelOptIn();
+    c.startOptIn();
+    QVERIFY(waitFor(5000, [&]() {
+        return amt.holdingReply() && amt.countOf("CancelOptIn") == 1;
+    }));
+    settle(200);
+    QCOMPARE(amt.countOf("GetOptInService"), readsBefore);
+
+    amt.releaseHeldReply();     // StartOptIn, refused
+    QVERIFY(waitFor(5000, [&]() { return c.optInState() == 0; }));
+    QCOMPARE(amt.optInState, 0);
+}
 
 // --- #437: OptInRequired granularity ---------------------------------
 //

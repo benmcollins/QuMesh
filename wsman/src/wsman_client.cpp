@@ -4,6 +4,7 @@
 #include "wsman/wsman_client.h"
 
 #include <QCryptographicHash>
+#include <QMetaObject>
 #include <QPointer>
 #include <QQueue>
 #include <QRandomGenerator>
@@ -22,6 +23,18 @@
 #endif
 
 namespace qumesh::wsman {
+
+namespace {
+
+/// `connectToHost` and a socket factory can fail synchronously, inside
+/// `sendEnvelope`, before the caller has connected to `finished()`.
+/// Queue the signal so the failure still reaches that caller.
+void emitFinishedQueued(WsmanReply *reply)
+{
+    QMetaObject::invokeMethod(reply, &WsmanReply::finished, Qt::QueuedConnection);
+}
+
+} // namespace
 
 namespace {
 
@@ -394,7 +407,7 @@ void wireSocketHandlers(WsmanReply *reply, WsmanClient *client,
         rd.errorString = rd.socket->errorString();
         rd.state = WsmanReply::Private::Failed;
         rd.finished = true;
-        emit wr->finished();
+        emitFinishedQueued(wr.data());
     });
 
     QObject::connect(sock, &QSslSocket::readyRead, reply,
@@ -511,7 +524,7 @@ void startTransport(WsmanReply *reply, WsmanClient *client,
                     rd.state = WsmanReply::Private::Failed;
                     rd.finished = true;
                     if (rd.timeoutTimer != nullptr) rd.timeoutTimer->stop();
-                    emit wr->finished();
+                    emitFinishedQueued(wr.data());
                     return;
                 }
                 auto *sock = new QSslSocket(wr.data());
@@ -522,7 +535,7 @@ void startTransport(WsmanReply *reply, WsmanClient *client,
                     rd.finished = true;
                     sock->deleteLater();
                     if (rd.timeoutTimer != nullptr) rd.timeoutTimer->stop();
-                    emit wr->finished();
+                    emitFinishedQueued(wr.data());
                     return;
                 }
                 finishViaFactorySocket(wr.data(), sock);

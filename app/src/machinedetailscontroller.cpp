@@ -596,16 +596,34 @@ void MachineDetailsController::refreshOptInStatus()
     m_optInStatusInFlight = true;
     m_pendingTrustResume = [this]{ refreshOptInStatus(); };
     incInflight();
+    const quint64 stateGeneration = m_optInStateGeneration;
+    // Only a read sent while polling is known to postdate this round's
+    // accepted StartOptIn.
+    const quint64 pollRound = m_optInPolling ? m_optInRoundSerial : 0;
     qumesh::wsman::getOptInStatus(m_client,
-        [this](qumesh::wsman::OptInServiceResult r) {
+        [this, stateGeneration, pollRound](qumesh::wsman::OptInServiceResult r) {
             m_optInStatusInFlight = false;
             if (r.ok) {
                 const bool wasKnown = m_optInStatusKnown;
                 m_optInStatusKnown = true;
                 const int prevState = m_optInState;
+                // A consent operation was answered while this read was
+                // on the wire, or a StartOptIn or CancelOptIn is still
+                // unanswered, so its OptInState may predate that change.
+                // Writing it back could undo a granted PIN or restore a
+                // cancelled consent. An unanswered SendOptInCode does not
+                // count: a read sent after it is the fallback that
+                // reports the grant if its reply is lost.
+                const bool staleState = (stateGeneration != m_optInStateGeneration)
+                                        || m_optInRoundOpsInFlight > 0;
+                // Even a stale read proves this round reached Displayed.
+                if (pollRound != 0 && pollRound == m_optInRoundSerial
+                    && r.optInState == 2) {
+                    m_optInRoundSawDisplayed = true;
+                }
                 m_optInRequired         = r.optInRequired;
                 m_optInRequiredRaw      = r.optInRequiredRaw;
-                m_optInState            = r.optInState;
+                if (!staleState) m_optInState = r.optInState;
                 m_canModifyOptInPolicy  = r.canModifyOptInPolicy;
                 m_kvmOptInPolicy        = r.kvmOptInPolicy;
                 m_optInPolicyTimeoutSec = r.optInPolicyTimeoutSec;
@@ -633,24 +651,30 @@ void MachineDetailsController::refreshOptInStatus()
                 // for state transitions caused by the target-side
                 // operator (Granted → unblock, NotStarted → cancelled
                 // at target).
-                if (m_optInPolling) {
+                if (m_optInPolling && !staleState) {
                     if (m_optInState == 3 || m_optInState == 4) {
                         // RECEIVED or IN_SESSION — consent is satisfied.
                         // Either the code we sent landed, or the operator
                         // approved at the target on firmware that allows
                         // it. Both end the round.
-                        stopOptInPolling();
-                        setOptInRoundActive(false);
+                        endOptInRound();
                         emit optInGranted();
-                    } else if (prevState >= 2 /* Displayed */
-                               && m_optInState <= 1 /* NotStarted/Requested */) {
+                    } else if ((m_optInRoundSawDisplayed
+                                && m_optInState <= 1 /* NotStarted/Requested */)
+                               || (m_optInRoundCancelRaced && m_optInState == 0)) {
                         // Target-side operator either cancelled or the
-                        // firmware timed out and dropped state back.
-                        stopOptInPolling();
-                        setOptInRoundActive(false);
+                        // firmware timed out and dropped state back, or
+                        // an older CancelOptIn landed after this round's
+                        // StartOptIn. Otherwise this round must really
+                        // have reached Displayed: Requested on the way up
+                        // is not an expiry.
+                        endOptInRound();
                         emit optInExpiredOrDenied();
                     }
                 }
+                // Polling reads again. Otherwise this read was the only
+                // answer coming, so replace it.
+                if (staleState && !m_optInPolling) requestOptInReread();
             }
             else if (!m_optInStatusKnown) {
                 qCWarning(lcOptIn) << "IPS_OptInService unreadable (" << r.error
@@ -677,6 +701,7 @@ void MachineDetailsController::refreshOptInStatus()
             // A later failure leaves the previously-read values alone —
             // a blip must not downgrade a machine we know needs consent.
             decInflight();
+            flushOptInReread();
         });
 }
 
@@ -776,10 +801,22 @@ void MachineDetailsController::startOptIn()
     }
     qCInfo(lcOptIn) << "StartOptIn invoked";
     setOptInRoundActive(true);
+    const quint64 round = ++m_optInRoundSerial;
+    m_optInRoundSawDisplayed = false;
+    m_optInRoundCancelRaced = false;
+    ++m_optInRoundOpsInFlight;
     incInflight();
     qumesh::wsman::startOptIn(m_client,
-        [this](qumesh::wsman::InvokeResult r) {
+        [this, round](qumesh::wsman::InvokeResult r) {
             decInflight();
+            endOptInRoundOp();
+            // A round that has ended must stay silent: optInStarted opens
+            // the consent dialog, and a late failure would release the
+            // latch of the round that replaced it.
+            if (round != m_optInRoundSerial) {
+                qCDebug(lcOptIn) << "ignoring StartOptIn reply for a round that has ended";
+                return;
+            }
             if (r.ok) {
                 qCInfo(lcOptIn) << "StartOptIn accepted — a code is on the "
                                     "target's screen; polling for the result";
@@ -809,10 +846,21 @@ void MachineDetailsController::sendOptInCode(int code)
     // screen — a live authorisation secret for the duration of the
     // round. It must never reach a log line users paste publicly.
     qCInfo(lcOptIn) << "SendOptInCode invoked (code redacted)";
+    const quint64 round = m_optInRoundSerial;
     incInflight();
     qumesh::wsman::sendOptInCode(m_client, static_cast<quint32>(code),
-        [this](qumesh::wsman::InvokeResult r) {
+        [this, round](qumesh::wsman::InvokeResult r) {
             decInflight();
+            ++m_optInStateGeneration;
+            // The round ended while this reply was on the wire. It must
+            // stay silent: optInCodeResult releases the waiting session,
+            // and a rejection reopens the dialog. An accepted code may
+            // still have moved the firmware, so ask it.
+            if (round != m_optInRoundSerial) {
+                qCInfo(lcOptIn) << "ignoring consent code reply for a round that has ended";
+                if (r.ok) requestOptInReread();
+                return;
+            }
             if (!r.ok) {
                 // Wrong code: the firmware keeps the round open, so
                 // stay latched and let the operator retype. Re-opening
@@ -827,9 +875,8 @@ void MachineDetailsController::sendOptInCode(int code)
             // a redirection session actually starts — it does NOT reach
             // IN_SESSION(4) on its own, so nothing further is pending.
             qCInfo(lcOptIn) << "consent code accepted — OptInState now Received(3)";
-            stopOptInPolling();
+            endOptInRound();
             m_optInFailures = 0;
-            setOptInRoundActive(false);
             m_optInState = 3;
             emit optInStatusChanged();
             emit optInCodeResult(true, QString());
@@ -839,17 +886,67 @@ void MachineDetailsController::sendOptInCode(int code)
 void MachineDetailsController::cancelOptIn()
 {
     qCInfo(lcOptIn) << "CancelOptIn invoked";
-    stopOptInPolling();
-    setOptInRoundActive(false);
+    endOptInRound();
+    const quint64 round = m_optInRoundSerial;
+    ++m_optInRoundOpsInFlight;
     incInflight();
     qumesh::wsman::cancelOptIn(m_client,
-        [this](qumesh::wsman::InvokeResult) {
+        [this, round](qumesh::wsman::InvokeResult r) {
             decInflight();
+            endOptInRoundOp();
+            if (!r.ok) {
+                // The firmware may still be in the round, or may have
+                // accepted a code just before this. Ask it.
+                qCWarning(lcOptIn) << "CancelOptIn failed:" << r.error;
+                requestOptInReread();
+                return;
+            }
+            // A newer round began while this reply was on the wire
+            // (SessionWindow sends cancel and start back to back).
+            // Writing NotStarted could erase consent it has gained, but
+            // the cancel may also have landed after it, so ask.
+            if (round != m_optInRoundSerial) {
+                m_optInRoundCancelRaced = true;
+                requestOptInReread();
+                return;
+            }
             // Reflect the firmware's post-cancel state locally without
             // re-entering the status read on this path.
             m_optInState = 0;
             emit optInStatusChanged();
         });
+}
+
+void MachineDetailsController::endOptInRoundOp()
+{
+    --m_optInRoundOpsInFlight;
+    ++m_optInStateGeneration;
+    flushOptInReread();
+}
+
+void MachineDetailsController::endOptInRound()
+{
+    stopOptInPolling();
+    setOptInRoundActive(false);
+    ++m_optInRoundSerial;
+}
+
+void MachineDetailsController::requestOptInReread()
+{
+    // Capped per Connect: SessionWindow answers a status change by
+    // cancelling a displayed round, so a firmware that keeps refusing
+    // the cancel would otherwise loop against the ME (#433).
+    if (m_optInRereadPending || m_optInRereads >= kMaxOptInFailures) return;
+    m_optInRereadPending = true;
+    flushOptInReread();
+}
+
+void MachineDetailsController::flushOptInReread()
+{
+    if (!m_optInRereadPending || m_optInRoundOpsInFlight > 0 || m_optInStatusInFlight) return;
+    m_optInRereadPending = false;
+    ++m_optInRereads;
+    refreshOptInStatus();
 }
 
 bool MachineDetailsController::consentRequiredFor(int protocol) const
@@ -884,6 +981,7 @@ void MachineDetailsController::setOptInRoundActive(bool v)
 void MachineDetailsController::resetOptInAttempts()
 {
     m_optInFailures = 0;
+    m_optInRereads = 0;
 }
 
 void MachineDetailsController::startOptInPolling()
