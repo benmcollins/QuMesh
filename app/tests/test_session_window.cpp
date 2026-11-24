@@ -12,6 +12,7 @@
 #include <QGuiApplication>
 #include <QSignalSpy>
 #include <QTcpServer>
+#include <QTcpSocket>
 #include <QtTest>
 
 using qumesh::app::MachineDetailsController;
@@ -22,15 +23,23 @@ using qumesh::testing::waitFor;
 
 namespace {
 
-/// A local port with nothing listening on it.
-quint16 deadPort()
+/// An SSH "server" that accepts and hangs up at once, so the tunnel
+/// fails straight away. A closed port won't do: Windows retries a
+/// refused localhost connect for several seconds.
+class HangUpServer : public QTcpServer
 {
-    QTcpServer s;
-    if (!s.listen(QHostAddress::LocalHost)) return 0;
-    const quint16 port = s.serverPort();
-    s.close();
-    return port;
-}
+public:
+    HangUpServer()
+    {
+        connect(this, &QTcpServer::newConnection, this, [this] {
+            while (QTcpSocket *s = nextPendingConnection()) {
+                s->close();
+                s->deleteLater();
+            }
+        });
+    }
+    bool start() { return listen(QHostAddress::LocalHost); }
+};
 
 QVariantMap sshTo(quint16 port)
 {
@@ -98,9 +107,11 @@ void TestSessionWindow::sshConfigSetAfterCreationKeepsConsentOffTheDirectPath()
     FakeAmt amt;
     QVERIFY(amt.listen());
     amt.optInRequired = 0;
+    HangUpServer ssh;
+    QVERIFY(ssh.start());
 
     auto w = m_harness->openWindow({ .wsmanPort = amt.port(),
-                                     .sshConfig = sshTo(deadPort()) });
+                                     .sshConfig = sshTo(ssh.serverPort()) });
     QVERIFY(w);
     MachineDetailsController *c = SessionWindowHarness::controller(w.get());
     QVERIFY(c);
@@ -119,7 +130,9 @@ void TestSessionWindow::sshConfigSetAfterCreationKeepsConsentOffTheDirectPath()
 // dropped when the tunnel fails, or Connect silently does nothing.
 void TestSessionWindow::failedTunnelStillResolvesConnect()
 {
-    auto w = m_harness->openWindow({ .sshConfig = sshTo(deadPort()) });
+    HangUpServer ssh;
+    QVERIFY(ssh.start());
+    auto w = m_harness->openWindow({ .sshConfig = sshTo(ssh.serverPort()) });
     QVERIFY(w);
     MachineDetailsController *c = SessionWindowHarness::controller(w.get());
     QVERIFY(c);
