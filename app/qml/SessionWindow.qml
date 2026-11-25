@@ -42,26 +42,42 @@ AppWindow {
         if (root.visible) root.raise();
     }
 
-    /// Panel index waiting on user consent before it may connect, or -1.
-    /// Redirection is a *precondition* of consent, not a parallel
+    /// Panels waiting on user consent before they may connect, in tab
+    /// order. Redirection is a *precondition* of consent, not a parallel
     /// activity: dialling 16994 while the firmware is still showing a
     /// code gets the session torn down when consent finally resolves.
-    property int pendingConnectTab: -1
+    /// A set, not one slot: a second panel's Connect during a round must
+    /// not drop the first one's (#462).
+    property var pendingConnectTabs: []
 
-    /// Advance whichever connect is waiting on consent. Called both
-    /// from `requestConnect` and from every opt-in status change, so a
-    /// status read that lands later still releases the pending panel.
-    /// Safe to call repeatedly — the controller latches a live round.
+    function clearPendingConnects() {
+        root.pendingConnectTabs = [];
+    }
+
+    function startPanel(tab) {
+        root.connectReleased(tab);
+        if (tab === 0) solPanel.start();
+        else if (tab === 1) kvmPanel.start();
+        else if (tab === 2) iderPanel.start();
+    }
+
+    /// Advance the connects waiting on consent. Called both from
+    /// `requestConnect` and from every opt-in status change, so a status
+    /// read that lands later still releases the waiting panels. Safe to
+    /// call repeatedly — the controller latches a live round.
     function driveConsent() {
-        if (root.pendingConnectTab < 0) return;
+        if (root.pendingConnectTabs.length === 0) return;
         if (!powerController.optInStatusKnown) return;
         // Per-protocol, not the coarse `optInSatisfied`: a machine set
         // to "required for KVM only" must not throw a consent PIN onto
         // the target's screen for a Serial Console session (#437).
-        if (powerController.consentSatisfiedFor(root.pendingConnectTab)) {
-            root.consentResolved();
-            return;
-        }
+        const ready = root.pendingConnectTabs.filter(
+            tab => powerController.consentSatisfiedFor(tab));
+        const waiting = root.pendingConnectTabs.filter(
+            tab => !powerController.consentSatisfiedFor(tab));
+        root.pendingConnectTabs = waiting;
+        for (const tab of ready) root.startPanel(tab);
+        if (waiting.length === 0) return;
         if (optInPrompt.opened || powerController.optInRoundActive) return;
         if (powerController.optInState === 2 /* Displayed */) {
             // A stale round from an earlier window is still on screen.
@@ -73,21 +89,19 @@ AppWindow {
         powerController.startOptIn();
     }
 
-    /// Consent just landed — release whichever panel was waiting on it,
+    /// Consent just landed — release every panel waiting on it,
     /// mirroring the reference client's connect-after-consent step.
     function consentResolved() {
-        const idx = root.pendingConnectTab;
-        root.pendingConnectTab = -1;
-        if (idx >= 0) root.connectReleased(idx);
-        if (idx === 0) solPanel.start();
-        else if (idx === 1) kvmPanel.start();
-        else if (idx === 2) iderPanel.start();
+        const tabs = root.pendingConnectTabs;
+        root.clearPendingConnects();
+        for (const tab of tabs) root.startPanel(tab);
     }
 
     /// Connect entry point for every panel. Starts once a fresh status
     /// read says consent isn't needed or is granted, otherwise asks.
     function requestConnect(idx) {
-        root.pendingConnectTab = idx;
+        if (!root.pendingConnectTabs.includes(idx))
+            root.pendingConnectTabs = root.pendingConnectTabs.concat([idx]).sort();
         powerController.resetOptInAttempts();
         // Always ask the firmware, even when the status is "known". The
         // default state reads as "no consent required", and a cached
@@ -148,14 +162,21 @@ AppWindow {
         // The read Connect is waiting on failed. Dialling on the cached
         // state could skip a consent the firmware now wants.
         onOptInStatusReadFailed: function(error) {
-            if (root.pendingConnectTab < 0 || powerController.optInRoundActive) return;
-            root.pendingConnectTab = -1;
+            if (root.pendingConnectTabs.length === 0 || powerController.optInRoundActive) return;
+            root.clearPendingConnects();
             ActivityHeartbeat.reportFailure(
                 qsTr("User consent: could not read the consent status: %1").arg(error));
         }
         onOptInStarted: function(ok, error) {
-            if (ok) optInPrompt.openFor(powerController.optInPolicyTimeoutSec);
-            else ActivityHeartbeat.reportFailure(qsTr("User consent: %1").arg(error));
+            if (ok) {
+                optInPrompt.openFor(powerController.optInPolicyTimeoutSec);
+                return;
+            }
+            // No round is running, so nothing will release the waiting
+            // panels. Left queued, a later Connect on an ungated panel
+            // would start a round and put a code on the target's screen.
+            root.clearPendingConnects();
+            ActivityHeartbeat.reportFailure(qsTr("User consent: %1").arg(error));
         }
         onOptInCodeResult: function(ok, error) {
             if (ok) {
@@ -171,6 +192,7 @@ AppWindow {
         }
         onOptInGaveUp: function(error) {
             optInPrompt.close();
+            root.clearPendingConnects();
             ActivityHeartbeat.reportFailure(qsTr("User consent: %1").arg(error));
         }
         // Polling signals from #171.
@@ -181,6 +203,7 @@ AppWindow {
         }
         onOptInExpiredOrDenied: {
             optInPrompt.close();
+            root.clearPendingConnects();
             ActivityHeartbeat.reportFailure(
                 qsTr("User consent expired or denied at the target."));
         }
@@ -220,7 +243,7 @@ AppWindow {
         id: optInPrompt
         onSubmitted: function(code) { powerController.sendOptInCode(code); }
         onCancelled: {
-            root.pendingConnectTab = -1;
+            root.clearPendingConnects();
             powerController.cancelOptIn();
         }
     }
@@ -238,7 +261,7 @@ AppWindow {
         solPanel.stop();
         kvmPanel.stop();
         iderPanel.stop();
-        root.pendingConnectTab = -1;
+        root.clearPendingConnects();
         // Don't leave the firmware displaying a consent code nobody is
         // going to type, and don't leave the 500 ms poll running
         // against the ME after the window is gone.

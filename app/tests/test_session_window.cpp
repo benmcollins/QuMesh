@@ -9,6 +9,8 @@
 #include "fake_amt.h"
 #include "session_window_harness.h"
 
+#include <algorithm>
+
 #include <QGuiApplication>
 #include <QSignalSpy>
 #include <QTcpServer>
@@ -41,6 +43,25 @@ public:
     }
     bool start() { return listen(QHostAddress::LocalHost); }
 };
+
+/// The window's `pendingConnectTabs`, the panels waiting on consent.
+QList<int> pendingTabs(QObject *window)
+{
+    QList<int> out;
+    const QVariantList tabs = window->property("pendingConnectTabs").toList();
+    for (const QVariant &v : tabs) out << v.toInt();
+    return out;
+}
+
+QList<int> releasedTabs(const QSignalSpy &spy)
+{
+    QList<int> out;
+    for (const QList<QVariant> &args : spy) out << args.at(0).toInt();
+    std::sort(out.begin(), out.end());
+    return out;
+}
+
+constexpr quint32 kConsentForAll = 0xFFFFFFFFu;
 
 QObject *optInPrompt(QObject *window)
 {
@@ -94,6 +115,13 @@ private slots:
     void escapeCancelsConsentRound();
     void noFirmwareTimeoutKeepsDialogOpen();
     void grantedCodeClosesDialogWithoutCancel();
+    // #462
+    void ungatedPanelDuringRoundKeepsWaitingPanel();
+    void acceptedCodeReleasesEveryWaitingPanel();
+    void cancelDropsEveryWaitingPanel();
+    void expiryDropsWaitingPanels();
+    void failedStartDropsWaitingPanel();
+    void panelsQueuedBeforeDialogShareOneRound();
 
 private:
     std::unique_ptr<SessionWindowHarness> m_harness;
@@ -228,7 +256,7 @@ void TestSessionWindow::failedRereadDropsConnect()
     QVERIFY(waitFor(5000, [&] { return readFailed.count() == 1; }));
     settle(200);
     QCOMPARE(released.count(), 1);
-    QCOMPARE(w->property("pendingConnectTab").toInt(), -1);
+    QVERIFY(pendingTabs(w.get()).isEmpty());
 }
 
 // #460 review: on firmware without IPS_OptInService every read fails.
@@ -279,7 +307,7 @@ void TestSessionWindow::escapeCancelsConsentRound()
     QVERIFY(waitFor(2000, [&] { return !promptOpen(w.get()); }));
     QVERIFY2(waitFor(5000, [&] { return amt.countOf(QStringLiteral("CancelOptIn")) == 1; }),
              qPrintable(amt.calls.join(QStringLiteral(", "))));
-    QCOMPARE(w->property("pendingConnectTab").toInt(), -1);
+    QVERIFY(pendingTabs(w.get()).isEmpty());
     QVERIFY(!c->optInRoundActive());
     settle(300);
     QCOMPARE(amt.countOf(QStringLiteral("CancelOptIn")), 1);
@@ -300,7 +328,7 @@ void TestSessionWindow::noFirmwareTimeoutKeepsDialogOpen()
     settle(2500);
     QVERIFY(promptOpen(w.get()));
     QCOMPARE(amt.countOf(QStringLiteral("CancelOptIn")), 0);
-    QCOMPARE(w->property("pendingConnectTab").toInt(), 1);
+    QCOMPARE(pendingTabs(w.get()), QList<int>{ 1 });
 }
 
 // #461: the window closes the dialog itself once the code is accepted.
@@ -324,6 +352,161 @@ void TestSessionWindow::grantedCodeClosesDialogWithoutCancel()
     settle(300);
     QCOMPARE(amt.countOf(QStringLiteral("CancelOptIn")), 0);
     QCOMPARE(amt.optInState, 3);
+}
+
+// #462: under a KVM-only policy, Serial Console needs no consent. A
+// click on it while Remote Desktop waits on a code goes straight
+// through, and must not take Remote Desktop's place in the queue.
+void TestSessionWindow::ungatedPanelDuringRoundKeepsWaitingPanel()
+{
+    FakeAmt amt;
+    QVERIFY(amt.listen());
+    amt.optInRequired = 1; // KVM only
+    auto w = m_harness->openWindow({ .wsmanPort = amt.port() });
+    QVERIFY(w);
+    MachineDetailsController *c = SessionWindowHarness::controller(w.get());
+    QVERIFY(c);
+    QSignalSpy released(w.get(), SIGNAL(connectReleased(int)));
+
+    QVERIFY2(openConsentDialog(w.get(), amt), qPrintable(amt.calls.join(QStringLiteral(", "))));
+    SessionWindowHarness::requestConnect(w.get(), 0);
+    QVERIFY(waitFor(5000, [&] { return released.count() == 1; }));
+    QCOMPARE(released.first().at(0).toInt(), 0);
+    QCOMPARE(pendingTabs(w.get()), QList<int>{ 1 });
+    QVERIFY(promptOpen(w.get()));
+
+    c->sendOptInCode(123456);
+    QVERIFY(waitFor(5000, [&] { return released.count() == 2; }));
+    QCOMPARE(releasedTabs(released), (QList<int>{ 0, 1 }));
+    QCOMPARE(amt.countOf(QStringLiteral("StartOptIn")), 1);
+}
+
+// #462: with consent required for everything, two panels waiting share
+// one round, and the accepted code lets both through.
+void TestSessionWindow::acceptedCodeReleasesEveryWaitingPanel()
+{
+    FakeAmt amt;
+    QVERIFY(amt.listen());
+    amt.optInRequired = kConsentForAll;
+    auto w = m_harness->openWindow({ .wsmanPort = amt.port() });
+    QVERIFY(w);
+    MachineDetailsController *c = SessionWindowHarness::controller(w.get());
+    QVERIFY(c);
+    QSignalSpy released(w.get(), SIGNAL(connectReleased(int)));
+
+    QVERIFY2(openConsentDialog(w.get(), amt), qPrintable(amt.calls.join(QStringLiteral(", "))));
+    SessionWindowHarness::requestConnect(w.get(), 0);
+    QVERIFY(waitFor(5000, [&] { return pendingTabs(w.get()) == QList<int>({ 0, 1 }); }));
+    settle(300);
+    QCOMPARE(released.count(), 0);
+
+    c->sendOptInCode(123456);
+    QVERIFY(waitFor(5000, [&] { return released.count() == 2; }));
+    QCOMPARE(releasedTabs(released), (QList<int>{ 0, 1 }));
+    QVERIFY(pendingTabs(w.get()).isEmpty());
+    QCOMPARE(amt.countOf(QStringLiteral("StartOptIn")), 1);
+}
+
+// #462: giving up on the code drops every panel waiting on it.
+void TestSessionWindow::cancelDropsEveryWaitingPanel()
+{
+    FakeAmt amt;
+    QVERIFY(amt.listen());
+    amt.optInRequired = kConsentForAll;
+    auto w = m_harness->openWindow({ .wsmanPort = amt.port() });
+    QVERIFY(w);
+    QSignalSpy released(w.get(), SIGNAL(connectReleased(int)));
+
+    QVERIFY2(openConsentDialog(w.get(), amt), qPrintable(amt.calls.join(QStringLiteral(", "))));
+    SessionWindowHarness::requestConnect(w.get(), 2);
+    QVERIFY(waitFor(5000, [&] { return pendingTabs(w.get()) == QList<int>({ 1, 2 }); }));
+
+    QMetaObject::invokeMethod(optInPrompt(w.get()), "reject");
+    QVERIFY(waitFor(5000, [&] { return amt.countOf(QStringLiteral("CancelOptIn")) == 1; }));
+    QVERIFY(pendingTabs(w.get()).isEmpty());
+    settle(300);
+    QCOMPARE(released.count(), 0);
+}
+
+// #462: when consent expires or is denied at the target, the panels
+// waiting on it are dropped. Left queued, nothing would ever release
+// them, and the next status change would quietly start another round.
+void TestSessionWindow::expiryDropsWaitingPanels()
+{
+    FakeAmt amt;
+    QVERIFY(amt.listen());
+    amt.optInRequired = kConsentForAll;
+    auto w = m_harness->openWindow({ .wsmanPort = amt.port() });
+    QVERIFY(w);
+    MachineDetailsController *c = SessionWindowHarness::controller(w.get());
+    QVERIFY(c);
+    QSignalSpy expired(c, &MachineDetailsController::optInExpiredOrDenied);
+
+    QVERIFY2(openConsentDialog(w.get(), amt), qPrintable(amt.calls.join(QStringLiteral(", "))));
+    // Let a poll see Displayed, then drop the round at the "target".
+    const int readsBefore = amt.countOf(QStringLiteral("GetOptInService"));
+    QVERIFY(waitFor(5000, [&] {
+        return amt.countOf(QStringLiteral("GetOptInService")) > readsBefore;
+    }));
+    amt.optInState = 0;
+    QVERIFY(waitFor(5000, [&] { return expired.count() == 1; }));
+    QVERIFY(pendingTabs(w.get()).isEmpty());
+    QVERIFY(!promptOpen(w.get()));
+
+    c->refreshOptInStatus(); // any later status change
+    settle(500);
+    QCOMPARE(amt.countOf(QStringLiteral("StartOptIn")), 1);
+}
+
+// #462 review: a refused StartOptIn ends the attempt. The waiting panel
+// is dropped, so a later Serial Console click (no consent needed under
+// a KVM-only policy) goes straight through instead of starting a round.
+void TestSessionWindow::failedStartDropsWaitingPanel()
+{
+    FakeAmt amt;
+    QVERIFY(amt.listen());
+    amt.optInRequired = 1; // KVM only
+    amt.startOptInReturnValue = 1;
+    auto w = m_harness->openWindow({ .wsmanPort = amt.port() });
+    QVERIFY(w);
+    QSignalSpy released(w.get(), SIGNAL(connectReleased(int)));
+
+    SessionWindowHarness::requestConnect(w.get(), 1);
+    QVERIFY(waitFor(5000, [&] { return amt.countOf(QStringLiteral("StartOptIn")) == 1; }));
+    QVERIFY(waitFor(5000, [&] { return pendingTabs(w.get()).isEmpty(); }));
+
+    amt.startOptInReturnValue = 0;
+    SessionWindowHarness::requestConnect(w.get(), 0);
+    QVERIFY(waitFor(5000, [&] { return released.count() == 1; }));
+    QCOMPARE(released.first().at(0).toInt(), 0);
+    settle(300);
+    QCOMPARE(amt.countOf(QStringLiteral("StartOptIn")), 1);
+    QVERIFY(!promptOpen(w.get()));
+}
+
+// #462: the operator can't click a second Connect while the modal code
+// dialog is up, but can before it opens. Both panels then share one
+// round, and the accepted code releases both.
+void TestSessionWindow::panelsQueuedBeforeDialogShareOneRound()
+{
+    FakeAmt amt;
+    QVERIFY(amt.listen());
+    amt.optInRequired = kConsentForAll;
+    auto w = m_harness->openWindow({ .wsmanPort = amt.port() });
+    QVERIFY(w);
+    MachineDetailsController *c = SessionWindowHarness::controller(w.get());
+    QVERIFY(c);
+    QSignalSpy released(w.get(), SIGNAL(connectReleased(int)));
+
+    SessionWindowHarness::requestConnect(w.get(), 1);
+    SessionWindowHarness::requestConnect(w.get(), 0);
+    QVERIFY(waitFor(5000, [&] { return promptOpen(w.get()); }));
+    QCOMPARE(pendingTabs(w.get()), (QList<int>{ 0, 1 }));
+
+    c->sendOptInCode(123456);
+    QVERIFY(waitFor(5000, [&] { return released.count() == 2; }));
+    QCOMPARE(releasedTabs(released), (QList<int>{ 0, 1 }));
+    QCOMPARE(amt.countOf(QStringLiteral("StartOptIn")), 1);
 }
 
 int main(int argc, char *argv[])
