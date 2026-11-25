@@ -13,6 +13,7 @@
 #include <QSignalSpy>
 #include <QTcpServer>
 #include <QTcpSocket>
+#include <QWindow>
 #include <QtTest>
 
 using qumesh::app::MachineDetailsController;
@@ -40,6 +41,26 @@ public:
     }
     bool start() { return listen(QHostAddress::LocalHost); }
 };
+
+QObject *optInPrompt(QObject *window)
+{
+    return window->findChild<QObject *>(QStringLiteral("optInPrompt"));
+}
+
+bool promptOpen(QObject *window)
+{
+    QObject *p = optInPrompt(window);
+    return p != nullptr && p->property("opened").toBool();
+}
+
+/// Start a consent round for the KVM tab and wait for the code dialog.
+bool openConsentDialog(QObject *window, const FakeAmt &amt)
+{
+    SessionWindowHarness::requestConnect(window, 1);
+    return waitFor(5000, [&] {
+        return amt.countOf(QStringLiteral("StartOptIn")) == 1 && promptOpen(window);
+    });
+}
 
 QVariantMap sshTo(quint16 port)
 {
@@ -69,6 +90,10 @@ private slots:
     void connectAfterSessionEndedAsksAgain();
     void failedRereadDropsConnect();
     void unreadableFirmwareConnectsEveryTime();
+    // #461
+    void escapeCancelsConsentRound();
+    void noFirmwareTimeoutKeepsDialogOpen();
+    void grantedCodeClosesDialogWithoutCancel();
 
 private:
     std::unique_ptr<SessionWindowHarness> m_harness;
@@ -229,6 +254,76 @@ void TestSessionWindow::unreadableFirmwareConnectsEveryTime()
         QVERIFY2(waitFor(15000, [&] { return released.count() == i; }),
                  qPrintable(QStringLiteral("Connect %1 was not released").arg(i)));
     }
+}
+
+// #461: Escape dismisses the dialog. That is the operator giving up,
+// so the round must be cancelled and the waiting Connect dropped, not
+// left running with the code still on the target's screen.
+void TestSessionWindow::escapeCancelsConsentRound()
+{
+    FakeAmt amt;
+    QVERIFY(amt.listen());
+    amt.optInRequired = 1;
+    auto w = m_harness->openWindow({ .wsmanPort = amt.port() });
+    QVERIFY(w);
+    auto *win = qobject_cast<QWindow *>(w.get());
+    QVERIFY(win);
+    win->show();
+    win->requestActivate();
+    QVERIFY(QTest::qWaitForWindowExposed(win));
+    MachineDetailsController *c = SessionWindowHarness::controller(w.get());
+    QVERIFY(c);
+
+    QVERIFY2(openConsentDialog(w.get(), amt), qPrintable(amt.calls.join(QStringLiteral(", "))));
+    QTest::keyClick(win, Qt::Key_Escape);
+    QVERIFY(waitFor(2000, [&] { return !promptOpen(w.get()); }));
+    QVERIFY2(waitFor(5000, [&] { return amt.countOf(QStringLiteral("CancelOptIn")) == 1; }),
+             qPrintable(amt.calls.join(QStringLiteral(", "))));
+    QCOMPARE(w->property("pendingConnectTab").toInt(), -1);
+    QVERIFY(!c->optInRoundActive());
+    settle(300);
+    QCOMPARE(amt.countOf(QStringLiteral("CancelOptIn")), 1);
+}
+
+// #461: firmware that sets no OptInPolicyTimeout reports 0. The dialog
+// has nothing to count down and must not cancel itself after a second.
+void TestSessionWindow::noFirmwareTimeoutKeepsDialogOpen()
+{
+    FakeAmt amt;
+    QVERIFY(amt.listen());
+    amt.optInRequired = 1;
+    amt.optInPolicyTimeout = 0;
+    auto w = m_harness->openWindow({ .wsmanPort = amt.port() });
+    QVERIFY(w);
+
+    QVERIFY2(openConsentDialog(w.get(), amt), qPrintable(amt.calls.join(QStringLiteral(", "))));
+    settle(2500);
+    QVERIFY(promptOpen(w.get()));
+    QCOMPARE(amt.countOf(QStringLiteral("CancelOptIn")), 0);
+    QCOMPARE(w->property("pendingConnectTab").toInt(), 1);
+}
+
+// #461: the window closes the dialog itself once the code is accepted.
+// That close must not read as the operator cancelling, which would
+// revoke the consent just granted.
+void TestSessionWindow::grantedCodeClosesDialogWithoutCancel()
+{
+    FakeAmt amt;
+    QVERIFY(amt.listen());
+    amt.optInRequired = 1;
+    auto w = m_harness->openWindow({ .wsmanPort = amt.port() });
+    QVERIFY(w);
+    MachineDetailsController *c = SessionWindowHarness::controller(w.get());
+    QVERIFY(c);
+    QSignalSpy released(w.get(), SIGNAL(connectReleased(int)));
+
+    QVERIFY2(openConsentDialog(w.get(), amt), qPrintable(amt.calls.join(QStringLiteral(", "))));
+    c->sendOptInCode(123456);
+    QVERIFY(waitFor(5000, [&] { return released.count() == 1; }));
+    QVERIFY(waitFor(2000, [&] { return !promptOpen(w.get()); }));
+    settle(300);
+    QCOMPARE(amt.countOf(QStringLiteral("CancelOptIn")), 0);
+    QCOMPARE(amt.optInState, 3);
 }
 
 int main(int argc, char *argv[])

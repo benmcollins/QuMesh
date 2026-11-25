@@ -40,6 +40,7 @@ public:
     quint32 startOptInReturnValue = 0;
     quint32 cancelReturnValue = 0;
     int startOptInState = 2;   ///< Where an accepted StartOptIn lands.
+    int optInPolicyTimeout = 60; ///< Seconds; 0 = no limit.
     QStringList calls;         ///< method names, in order
 
     ~FakeAmt() override
@@ -208,11 +209,12 @@ private:
                         "</g:IPS_OptInService>");
     }
 
-    static QByteArray kvmSettingsReply()
+    QByteArray kvmSettingsReply() const
     {
         return envelope("<k:IPS_KVMRedirectionSettingData>"
                         "<k:OptInPolicy>true</k:OptInPolicy>"
-                        "<k:OptInPolicyTimeout>60</k:OptInPolicyTimeout>"
+                        "<k:OptInPolicyTimeout>" + QByteArray::number(optInPolicyTimeout)
+                        + "</k:OptInPolicyTimeout>"
                         "<k:Is5900PortEnabled>false</k:Is5900PortEnabled>"
                         "<k:SessionTimeout>0</k:SessionTimeout>"
                         "</k:IPS_KVMRedirectionSettingData>");
