@@ -56,6 +56,8 @@ public:
         return m_server.listen(QHostAddress::LocalHost);
     }
     [[nodiscard]] quint16 port() const { return m_server.serverPort(); }
+    /// Stop accepting connections, so the next request fails.
+    void stopListening() { m_server.close(); }
 
     [[nodiscard]] int countOf(const QString &method) const
     {

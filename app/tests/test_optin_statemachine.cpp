@@ -52,6 +52,7 @@ private slots:
     void repeatedStartFailuresGiveUpInsteadOfLooping();
     void rejectedCodeKeepsRoundOpen();
     void unreadableStatusResolvesToNotRequired();
+    void laterFailedReadIsReported();
     // A status read that predates a consent operation must not undo it.
     void staleReadDoesNotUndoGrantedConsent();
     void staleReadDoesNotRestoreCancelledConsent();
@@ -290,6 +291,31 @@ void TestOptInStateMachine::unreadableStatusResolvesToNotRequired()
     QCOMPARE(unavailableSpy.count(), 1);
     QVERIFY2(c.optInSatisfied(),
               "an unreadable consent policy must not block redirection");
+}
+
+// #460: once the status is known, a failed read keeps the cached values
+// but must say so, or a Connect waiting on it never hears back.
+void TestOptInStateMachine::laterFailedReadIsReported()
+{
+    FakeAmt amt;
+    QVERIFY(amt.listen());
+    MachineDetailsController c;
+    aim(c, amt);
+    QSignalSpy changed(&c, &MachineDetailsController::optInStatusChanged);
+    QSignalSpy failed(&c, &MachineDetailsController::optInStatusReadFailed);
+    QSignalSpy unavailable(&c, &MachineDetailsController::optInStatusUnavailable);
+
+    c.refreshOptInStatus();
+    QVERIFY(waitFor(5000, [&]() { return c.optInStatusKnown(); }));
+    QVERIFY(c.optInRequired());
+    const int changesBefore = changed.count();
+
+    amt.stopListening();
+    c.refreshOptInStatus();
+    QVERIFY(waitFor(5000, [&]() { return failed.count() == 1; }));
+    QCOMPARE(unavailable.count(), 0);
+    QCOMPARE(changed.count(), changesBefore);
+    QVERIFY2(c.optInRequired(), "a failed read must not downgrade the policy");
 }
 
 void TestOptInStateMachine::staleReadDoesNotUndoGrantedConsent()

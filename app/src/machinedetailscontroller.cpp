@@ -630,6 +630,7 @@ void MachineDetailsController::refreshOptInStatus()
             if (r.ok) {
                 const bool wasKnown = m_optInStatusKnown;
                 m_optInStatusKnown = true;
+                m_optInStatusReadOk = true;
                 const int prevState = m_optInState;
                 // A consent operation was answered while this read was
                 // on the wire, or a StartOptIn or CancelOptIn is still
@@ -700,11 +701,12 @@ void MachineDetailsController::refreshOptInStatus()
                 // answer coming, so replace it.
                 if (staleState && !m_optInPolling) requestOptInReread();
             }
-            else if (!m_optInStatusKnown) {
+            else if (!m_optInStatusReadOk) {
                 qCWarning(lcOptIn) << "IPS_OptInService unreadable (" << r.error
                                     << ") — treating consent as not required";
-                // Soft failure on the FIRST read: older AMT firmware
-                // (<= 5) doesn't expose IPS_OptInService at all, and a
+                // Soft failure while no read has ever succeeded: older
+                // AMT firmware (<= 5) doesn't expose IPS_OptInService at
+                // all, so on such a machine every read lands here, and a
                 // transport hiccup looks identical from here.
                 //
                 // Resolve to "consent not required" and mark the status
@@ -721,6 +723,9 @@ void MachineDetailsController::refreshOptInStatus()
                 m_optInRequired = false;
                 emit optInStatusChanged();
                 emit optInStatusUnavailable(r.error);
+            } else if (!m_optInPolling) {
+                qCWarning(lcOptIn) << "IPS_OptInService read failed:" << r.error;
+                emit optInStatusReadFailed(r.error);
             }
             // A later failure leaves the previously-read values alone —
             // a blip must not downgrade a machine we know needs consent.

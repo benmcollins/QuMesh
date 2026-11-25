@@ -65,6 +65,10 @@ private slots:
     void consentIsReadDirectlyWithoutSsh();
     void sshConfigSetAfterCreationKeepsConsentOffTheDirectPath();
     void failedTunnelStillResolvesConnect();
+    // #460
+    void connectAfterSessionEndedAsksAgain();
+    void failedRereadDropsConnect();
+    void unreadableFirmwareConnectsEveryTime();
 
 private:
     std::unique_ptr<SessionWindowHarness> m_harness;
@@ -144,6 +148,87 @@ void TestSessionWindow::failedTunnelStillResolvesConnect()
                             .arg(c->sshTunnelStatus())));
     QVERIFY(c->sshTunnelStatus().startsWith(QStringLiteral("SSH failed")));
     QVERIFY(waitFor(2000, [&] { return released.count() == 1; }));
+}
+
+// #460: AMT drops consent when the session it was granted for ends.
+// The window still holds Received(3) from the last round, so a second
+// Connect must ask the firmware, not dial on the cached state.
+void TestSessionWindow::connectAfterSessionEndedAsksAgain()
+{
+    FakeAmt amt;
+    QVERIFY(amt.listen());
+    amt.optInRequired = 1; // KVM only
+
+    auto w = m_harness->openWindow({ .wsmanPort = amt.port() });
+    QVERIFY(w);
+    MachineDetailsController *c = SessionWindowHarness::controller(w.get());
+    QVERIFY(c);
+    QSignalSpy started(c, &MachineDetailsController::optInStarted);
+    QSignalSpy released(w.get(), SIGNAL(connectReleased(int)));
+
+    SessionWindowHarness::requestConnect(w.get(), 1);
+    QVERIFY(waitFor(5000, [&] { return started.count() == 1; }));
+    c->sendOptInCode(123456);
+    QVERIFY(waitFor(5000, [&] { return released.count() == 1; }));
+    QCOMPARE(c->optInState(), 3);
+
+    amt.optInState = 0; // the session ended; the firmware dropped consent
+    SessionWindowHarness::requestConnect(w.get(), 1);
+    QVERIFY2(waitFor(5000, [&] { return started.count() == 2; }),
+             qPrintable(amt.calls.join(QStringLiteral(", "))));
+    QCOMPARE(released.count(), 1);
+    QCOMPARE(amt.countOf(QStringLiteral("StartOptIn")), 2);
+}
+
+// #460: if the re-read fails, the cached state is no basis for a
+// connect. The window drops the Connect instead of dialling.
+void TestSessionWindow::failedRereadDropsConnect()
+{
+    FakeAmt amt;
+    QVERIFY(amt.listen());
+    amt.optInRequired = 0;
+
+    auto w = m_harness->openWindow({ .wsmanPort = amt.port() });
+    QVERIFY(w);
+    MachineDetailsController *c = SessionWindowHarness::controller(w.get());
+    QVERIFY(c);
+    QSignalSpy released(w.get(), SIGNAL(connectReleased(int)));
+    QSignalSpy readFailed(c, &MachineDetailsController::optInStatusReadFailed);
+
+    SessionWindowHarness::requestConnect(w.get(), 1);
+    QVERIFY(waitFor(5000, [&] { return released.count() == 1; }));
+
+    amt.stopListening();
+    SessionWindowHarness::requestConnect(w.get(), 1);
+    QVERIFY(waitFor(5000, [&] { return readFailed.count() == 1; }));
+    settle(200);
+    QCOMPARE(released.count(), 1);
+    QCOMPARE(w->property("pendingConnectTab").toInt(), -1);
+}
+
+// #460 review: on firmware without IPS_OptInService every read fails.
+// The first one falls back to "consent not required"; the later ones
+// must keep doing so, not count as a failed re-read of a known status.
+void TestSessionWindow::unreadableFirmwareConnectsEveryTime()
+{
+    // Accepts and hangs up without replying, like an absent class.
+    QTcpServer dead;
+    QVERIFY(dead.listen(QHostAddress::LocalHost));
+    QObject::connect(&dead, &QTcpServer::newConnection, &dead, [&dead] {
+        while (QTcpSocket *s = dead.nextPendingConnection()) {
+            s->close();
+            s->deleteLater();
+        }
+    });
+
+    auto w = m_harness->openWindow({ .wsmanPort = dead.serverPort() });
+    QVERIFY(w);
+    QSignalSpy released(w.get(), SIGNAL(connectReleased(int)));
+    for (int i = 1; i <= 3; ++i) {
+        SessionWindowHarness::requestConnect(w.get(), 0);
+        QVERIFY2(waitFor(15000, [&] { return released.count() == i; }),
+                 qPrintable(QStringLiteral("Connect %1 was not released").arg(i)));
+    }
 }
 
 int main(int argc, char *argv[])
