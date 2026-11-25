@@ -41,6 +41,11 @@ public:
     quint32 cancelReturnValue = 0;
     int startOptInState = 2;   ///< Where an accepted StartOptIn lands.
     int optInPolicyTimeout = 60; ///< Seconds; 0 = no limit.
+    /// IPS_KVMRedirectionSettingData fields a Put can change.
+    bool kvmOptInPolicy = true;
+    int kvmSessionTimeout = 0;
+    /// Hang up on the next KVM settings Put without applying it.
+    bool dropNextKvmSettingsPut = false;
     QStringList calls;         ///< method names, in order
 
     ~FakeAmt() override
@@ -132,6 +137,13 @@ private:
             optInState = liveState;
             return;
         }
+        if (dropNextKvmSettingsPut && body.contains("IPS_KVMRedirectionSettingData")
+            && body.contains("transfer/Put")) {
+            dropNextKvmSettingsPut = false;
+            calls << QStringLiteral("PutKvmSettings(dropped)");
+            sock->disconnectFromHost();
+            return;
+        }
         if (!m_holdMethod.isEmpty() && body.contains(m_holdMethod)) {
             m_holdMethod.clear();
             m_held.append({ sock, respond(body) });
@@ -168,6 +180,11 @@ private:
             calls << QStringLiteral("CancelOptIn");
             if (cancelReturnValue == 0) optInState = 0;
             payload = invokeReply("CancelOptIn", cancelReturnValue);
+        } else if (body.contains("IPS_KVMRedirectionSettingData")
+                   && body.contains("transfer/Put")) {
+            calls << QStringLiteral("PutKvmSettings");
+            applyKvmSettingsPut(body);
+            payload = kvmSettingsReply();
         } else if (body.contains("IPS_KVMRedirectionSettingData")) {
             calls << QStringLiteral("GetKvmSettings");
             payload = kvmSettingsReply();
@@ -209,14 +226,39 @@ private:
                         "</g:IPS_OptInService>");
     }
 
+    /// The text of the first `<…name>value</…name>` element, or empty.
+    static QByteArray elementText(const QByteArray &body, const QByteArray &name)
+    {
+        QByteArray open = ":" + name + ">";
+        int at = body.indexOf(open);
+        if (at < 0) {
+            open = "<" + name + ">";
+            at = body.indexOf(open);
+        }
+        if (at < 0) return {};
+        at += open.size();
+        const int end = body.indexOf('<', at);
+        return end < 0 ? QByteArray() : body.mid(at, end - at);
+    }
+
+    void applyKvmSettingsPut(const QByteArray &body)
+    {
+        const QByteArray policy = elementText(body, "OptInPolicy");
+        if (!policy.isEmpty()) kvmOptInPolicy = policy == "true";
+        const QByteArray timeout = elementText(body, "SessionTimeout");
+        if (!timeout.isEmpty()) kvmSessionTimeout = timeout.toInt();
+    }
+
     QByteArray kvmSettingsReply() const
     {
         return envelope("<k:IPS_KVMRedirectionSettingData>"
-                        "<k:OptInPolicy>true</k:OptInPolicy>"
+                        "<k:OptInPolicy>" + QByteArray(kvmOptInPolicy ? "true" : "false")
+                        + "</k:OptInPolicy>"
                         "<k:OptInPolicyTimeout>" + QByteArray::number(optInPolicyTimeout)
                         + "</k:OptInPolicyTimeout>"
                         "<k:Is5900PortEnabled>false</k:Is5900PortEnabled>"
-                        "<k:SessionTimeout>0</k:SessionTimeout>"
+                        "<k:SessionTimeout>" + QByteArray::number(kvmSessionTimeout)
+                        + "</k:SessionTimeout>"
                         "</k:IPS_KVMRedirectionSettingData>");
     }
 

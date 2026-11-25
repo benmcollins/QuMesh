@@ -53,6 +53,12 @@ private slots:
     void rejectedCodeKeepsRoundOpen();
     void unreadableStatusResolvesToNotRequired();
     void laterFailedReadIsReported();
+    // #463: a consent policy write must not be undone by a read spanning it.
+    void policyWriteSurvivesReadSpanningIt();
+    void kvmSettingsWriteSurvivesReadSpanningIt();
+    void readWithoutWriteStillUpdatesPolicy();
+    void firstReadSpanningWriteStillSetsPolicy();
+    void failedPolicyWriteStillRereads();
     // A status read that predates a consent operation must not undo it.
     void staleReadDoesNotUndoGrantedConsent();
     void staleReadDoesNotRestoreCancelledConsent();
@@ -316,6 +322,158 @@ void TestOptInStateMachine::laterFailedReadIsReported()
     QCOMPARE(unavailable.count(), 0);
     QCOMPARE(changed.count(), changesBefore);
     QVERIFY2(c.optInRequired(), "a failed read must not downgrade the policy");
+}
+
+// #463: a status read already on the wire when the operator turns the
+// KVM consent policy off reports it still on. Landing after the write,
+// it must not put it back, and the follow-up read the write asks for
+// must not be lost to the in-flight guard.
+void TestOptInStateMachine::policyWriteSurvivesReadSpanningIt()
+{
+    FakeAmt amt;
+    QVERIFY(amt.listen());
+    MachineDetailsController c;
+    aim(c, amt);
+    c.refreshOptInStatus();
+    QVERIFY(waitFor(5000, [&]() { return c.optInStatusKnown(); }));
+    QVERIFY(c.kvmOptInPolicy());
+
+    amt.holdNextReplyTo("IPS_KVMRedirectionSettingData");
+    c.refreshOptInStatus();
+    QVERIFY(waitFor(5000, [&]() { return amt.heldReplies() == 1; }));
+
+    c.setKvmOptInPolicyEnabled(false);
+    QVERIFY(waitFor(5000, [&]() { return amt.countOf(QStringLiteral("PutKvmSettings")) == 1; }));
+    QVERIFY(waitFor(5000, [&]() { return !c.kvmOptInPolicy(); }));
+    const int readsBefore = amt.countOf(QStringLiteral("GetOptInService"));
+    // Every value shown from here on, not just the last: the follow-up
+    // read would hide a brief revert.
+    QList<bool> shown;
+    QObject::connect(&c, &MachineDetailsController::optInStatusChanged, &c,
+                     [&]() { shown << c.kvmOptInPolicy(); });
+
+    amt.releaseHeldReply(); // still reports the policy on
+    QVERIFY2(waitFor(5000, [&]() {
+                 return amt.countOf(QStringLiteral("GetOptInService")) > readsBefore;
+             }),
+             "the write's follow-up read never went out");
+    settle(500);
+    QVERIFY2(!shown.contains(true), "a read spanning the write put the old policy back");
+    QVERIFY(!c.kvmOptInPolicy());
+    QVERIFY(!amt.kvmOptInPolicy);
+}
+
+// #463: the same for the KVM settings dialog's write.
+void TestOptInStateMachine::kvmSettingsWriteSurvivesReadSpanningIt()
+{
+    FakeAmt amt;
+    QVERIFY(amt.listen());
+    MachineDetailsController c;
+    aim(c, amt);
+    c.refreshOptInStatus();
+    QVERIFY(waitFor(5000, [&]() { return c.optInStatusKnown(); }));
+    QCOMPARE(c.kvmSessionTimeoutMinutes(), 0);
+
+    amt.holdNextReplyTo("IPS_KVMRedirectionSettingData");
+    c.refreshOptInStatus();
+    QVERIFY(waitFor(5000, [&]() { return amt.heldReplies() == 1; }));
+
+    c.setKvmSettings({ { QStringLiteral("sessionTimeoutMinutes"), 15 } });
+    QVERIFY(waitFor(5000, [&]() { return amt.countOf(QStringLiteral("PutKvmSettings")) == 1; }));
+    QCOMPARE(amt.kvmSessionTimeout, 15);
+    const int readsBefore = amt.countOf(QStringLiteral("GetOptInService"));
+    QList<int> shown;
+    QObject::connect(&c, &MachineDetailsController::optInStatusChanged, &c,
+                     [&]() { shown << c.kvmSessionTimeoutMinutes(); });
+
+    amt.releaseHeldReply(); // still reports 0
+    QVERIFY2(waitFor(5000, [&]() { return c.kvmSessionTimeoutMinutes() == 15; }),
+             "the written session timeout never showed up");
+    QVERIFY(amt.countOf(QStringLiteral("GetOptInService")) > readsBefore);
+    settle(500);
+    QCOMPARE(c.kvmSessionTimeoutMinutes(), 15);
+    // Nothing local changes until a read reports the write, so the stale
+    // read can only repeat 0. Once 15 is shown it must stay.
+    const qsizetype first15 = shown.indexOf(15);
+    QVERIFY(first15 >= 0);
+    QVERIFY2(!shown.mid(first15).contains(0), qPrintable(QStringLiteral("shown: %1").arg(
+        [&] { QStringList s; for (int v : shown) s << QString::number(v); return s.join(u','); }())));
+}
+
+// #463 guard: with no write in between, a read still updates the policy.
+void TestOptInStateMachine::readWithoutWriteStillUpdatesPolicy()
+{
+    FakeAmt amt;
+    QVERIFY(amt.listen());
+    MachineDetailsController c;
+    aim(c, amt);
+    c.refreshOptInStatus();
+    QVERIFY(waitFor(5000, [&]() { return c.optInStatusKnown(); }));
+    QVERIFY(c.kvmOptInPolicy());
+
+    amt.kvmOptInPolicy = false; // changed at the target, e.g. in MEBx
+    amt.optInRequired = 0;
+    c.refreshOptInStatus();
+    QVERIFY(waitFor(5000, [&]() { return !c.kvmOptInPolicy(); }));
+    QVERIFY(!c.optInRequired());
+}
+
+// #463 guard: with nothing read yet, the defaults say "no consent
+// required". The first read must be kept even if a write overtook it;
+// discarding it would mark the status known on those defaults.
+void TestOptInStateMachine::firstReadSpanningWriteStillSetsPolicy()
+{
+    FakeAmt amt;
+    QVERIFY(amt.listen());
+    amt.optInRequired = 1; // KVM only
+    MachineDetailsController c;
+    aim(c, amt);
+    QList<bool> requiredWhenKnown;
+    QObject::connect(&c, &MachineDetailsController::optInStatusChanged, &c, [&]() {
+        if (c.optInStatusKnown()) requiredWhenKnown << c.optInRequired();
+    });
+
+    amt.holdNextReplyTo("IPS_KVMRedirectionSettingData");
+    c.refreshOptInStatus();
+    QVERIFY(waitFor(5000, [&]() { return amt.heldReplies() == 1; }));
+    c.setKvmOptInPolicyEnabled(true);
+    QVERIFY(waitFor(5000, [&]() { return amt.countOf(QStringLiteral("PutKvmSettings")) == 1; }));
+    settle(200);
+
+    amt.releaseHeldReply();
+    QVERIFY(waitFor(5000, [&]() { return c.optInStatusKnown(); }));
+    settle(500);
+    QVERIFY(!requiredWhenKnown.isEmpty());
+    QVERIFY2(!requiredWhenKnown.contains(false),
+             "consent status read as known while still on the 'not required' defaults");
+}
+
+// #463 review: a failed write still overtakes the read on the wire, so
+// that read is not kept. Without a follow-up, a policy changed elsewhere
+// (here: another console turned it off) would stay hidden.
+void TestOptInStateMachine::failedPolicyWriteStillRereads()
+{
+    FakeAmt amt;
+    QVERIFY(amt.listen());
+    MachineDetailsController c;
+    aim(c, amt);
+    c.refreshOptInStatus();
+    QVERIFY(waitFor(5000, [&]() { return c.optInStatusKnown(); }));
+    QVERIFY(c.kvmOptInPolicy());
+
+    amt.kvmOptInPolicy = false;
+    amt.holdNextReplyTo("IPS_KVMRedirectionSettingData");
+    c.refreshOptInStatus();
+    QVERIFY(waitFor(5000, [&]() { return amt.heldReplies() == 1; }));
+
+    QSignalSpy failed(&c, &MachineDetailsController::optInPolicyChangeFailed);
+    amt.dropNextKvmSettingsPut = true;
+    c.setKvmOptInPolicyEnabled(true);
+    QVERIFY(waitFor(15000, [&]() { return failed.count() == 1; }));
+
+    amt.releaseHeldReply();
+    QVERIFY2(waitFor(5000, [&]() { return !c.kvmOptInPolicy(); }),
+             qPrintable(amt.calls.join(QStringLiteral(", "))));
 }
 
 void TestOptInStateMachine::staleReadDoesNotUndoGrantedConsent()
